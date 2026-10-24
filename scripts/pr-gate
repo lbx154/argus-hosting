@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Source-checkout entry point for the local regression gate (argus-hosting checkout root)."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from argus_hosting.pr_gate.regression.cli import main
+
+raise SystemExit(main())

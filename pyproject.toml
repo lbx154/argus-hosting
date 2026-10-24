@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "argus-hosting"
+version = "0.1.0"
+description = "Release-gate and hosting tooling for Argus, kept outside the Argus core repository."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+  { name = "lbx154" },
+]
+# Argus itself is not a declared dependency: the code here imports it only on
+# Windows (process supervision) and the tests expect an Argus checkout on
+# PYTHONPATH. See README.md.
+dependencies = [
+  "jsonschema>=4",
+  "portalocker>=3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7",
+  "pytest-xdist>=3",
+  "ruff>=0.4",
+]
+
+[project.scripts]
+pr-gate = "argus_hosting.pr_gate.regression.cli:main"
+
+[project.urls]
+Repository = "https://github.com/lbx154/argus-hosting"
+Argus = "https://github.com/lbx154/Argus"
+
+[tool.hatch.build.targets.wheel]
+packages = ["argus_hosting"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["build", "dist", ".venv", "argus-src"]
+
+[tool.ruff.lint]
+select = ["F", "E", "I"]
+ignore = ["E501", "E402", "E731"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["argus_hosting"]
+known-third-party = ["argus"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

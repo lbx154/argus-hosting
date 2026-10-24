@@ -1,0 +1,54 @@
+name: tests
+
+# Runs this repository's tests against the current Argus `dev` branch.
+# The nightly run catches Argus changes that break the tooling here.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      argus_ref:
+        description: "Argus branch, tag or commit to test against"
+        required: false
+        default: dev
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check out Argus
+        uses: actions/checkout@v4
+        with:
+          repository: lbx154/Argus
+          ref: ${{ github.event.inputs.argus_ref || 'dev' }}
+          path: argus-src
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check argus_hosting tests scripts/pr-gate experiments
+      - name: Test
+        env:
+          PYTHONPATH: ${{ github.workspace }}/argus-src
+        run: python -m pytest -q -n 4 tests
+      - name: Description gate smoke run
+        env:
+          PYTHONPATH: ${{ github.workspace }}/argus-src
+        run: python -m argus_hosting.pr_gate --help
