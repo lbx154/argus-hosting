@@ -41,6 +41,20 @@ argus-trial-server login \
 
 Docker Buildx 的上下文必须分别指定。`/srv/runtime-tools/copilot` 是已准备的独立可执行 Copilot；Pi 的 `argus-pi` 上下文包含 package.json、node_modules 和 packages，`node-runtime` 包含名为 node 的可执行文件。使用已验证的工具版本，工具获取与私密授权分开。
 
+镜像构建前，从所选 Argus 源码生成打包所需资产：
+
+```sh
+python -m pip install build
+npm --prefix "$ARGUS_SOURCE_DIR" ci
+npm --prefix "$ARGUS_SOURCE_DIR" run build
+npm --prefix "$ARGUS_SOURCE_DIR/frontend/web" ci
+npm --prefix "$ARGUS_SOURCE_DIR/frontend/tui" ci
+(cd "$ARGUS_SOURCE_DIR" && python -m argus.release_tools.build_release)
+```
+
+Argus 构建上下文仅放源码及必要资产，不带个人 home、账本或凭据。Pi 观察器使用它的已验证版本，详情见研究指南。把 compute 镜像标签写入 `compute.json`。
+
+
 ```sh
 ARGUS_REV=$(git -C "$ARGUS_SOURCE_DIR" rev-parse HEAD)
 HOSTING_REV=$(git -C "$ARGUS_HOSTING_SOURCE" rev-parse HEAD)
@@ -63,8 +77,6 @@ docker buildx build --load -f deploy/compute.Dockerfile \
   --build-arg WEB_BASE_IMAGE="$ARGUS_PI_IMAGE" \
   -t "argus-web-compute:$ARGUS_REV-$HOSTING_REV" .
 ```
-
-Argus 构建上下文仅放源码及按发布流程生成的必要资产，不带个人 home、账本或凭据。先按 Argus 的发布工具生成其打包所需资产。Pi 观察器使用它的已验证版本，详情见研究指南。把 compute 镜像标签写入 `compute.json`。
 
 ## 启动顺序
 

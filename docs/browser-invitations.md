@@ -44,4 +44,3 @@ How it differs from a local install:
 When you outgrow the trial (your own data, your own agent CLI, longer
 campaigns), use the [local installation guide](https://github.com/lbx154/Argus/blob/chore/hosting-out/docs/getting-started.md). The entry page is in
 Simplified Chinese; the workspace follows your browser language.
-
