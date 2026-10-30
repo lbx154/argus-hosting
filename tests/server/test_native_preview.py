@@ -472,7 +472,7 @@ def test_watchdog_accepts_normal_multirole_copilot_memory():
     assert monitor.exceeded() == ''  # The previously observed 2.2 GiB / 199-thread case must remain usable.
     monitor.process.memory = 9 * 1024**3
     assert monitor.exceeded() == ''  # A 9 GiB experiment is ordinary work, not a runaway.
-    monitor.process.memory = 65 * 1024**3
+    monitor.process.memory = 129 * 1024**3
     assert monitor.exceeded() == 'memory'
 
 
@@ -636,6 +636,6 @@ def test_a_tenant_runs_as_many_projects_at_once_as_configured(config, tmp_path):
     config['tenants']['alice']['directory'] = str(tmp_path / 'alice')
     def daemons(cmd):
         return cmd[cmd.index('ARGUS_SKILL_MAX_ACTIVE_DAEMONS') + 1]
-    assert daemons(sandbox_command(config, 'alice')) == '1'
+    assert daemons(sandbox_command(config, 'alice')) == '64'  # one person's several projects all run
     config['limits'] = {'daemons': 3}
     assert daemons(sandbox_command(config, 'alice')) == '3'
