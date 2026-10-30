@@ -8,8 +8,8 @@ The operator's GitHub login remains outside every runtime.
 
 ## Requirements and initialization
 
-Use a pinned checkout with rebuilt release artifacts, Python 3.11+, Argus's
-`trial` extra, Node, Copilot CLI with BYOK Responses support, bubblewrap and a
+Use pinned Argus and argus-hosting checkouts with rebuilt release artifacts,
+Python 3.11+, both packages installed in the same environment, Node, Copilot CLI with BYOK Responses support, bubblewrap and a
 working systemd user manager. Warm up Copilot CLI on the operator account first;
 only its extracted `~/.cache/copilot/pkg` packages are mounted into guests.
 Do not mount the rest of the operator cache or home. The reference deployment
@@ -18,10 +18,11 @@ uses Copilot CLI 1.0.94 and Python 3.12.
 Run `native_setup.py --help` for the required paths. For example:
 
 ```sh
-.venv/bin/python trial_server/deploy/native_setup.py \
+/srv/argus-env/bin/python /srv/src/argus-hosting/deploy/native_setup.py \
   --root /srv/private-argus-preview \
-  --source /srv/argus-release \
-  --venv /srv/argus-release/.venv \
+  --source /srv/src/argus \
+  --hosting-source /srv/src/argus-hosting \
+  --venv /srv/argus-env \
   --python-runtime /opt/python-3.12 \
   --node-runtime /opt/node \
   --copilot-package "$HOME/.cache/copilot/pkg" \
@@ -31,7 +32,10 @@ Run `native_setup.py --help` for the required paths. For example:
 Keep the private root outside Git. `preview.json` and `invitations.txt` are
 operator-only files. Reinitializing an existing root preserves invitations,
 charges and limits. To upgrade, stop the services, update `source` and `revision`
-to a checked, pushed commit, reinstall service definitions and restart. Never
+and `hosting_source` to checked commits, reinstall service definitions and restart.
+An existing preview.json must explicitly gain `hosting_source`; initialization
+preserves the file and does not update it automatically. The two source mounts
+remain read-only. See [two-package installation](../README.md#安装到托管机器). Never
 recreate the ledger to replenish a trial.
 
 The meter serializes admission in SQLite, reserves conservative text input and

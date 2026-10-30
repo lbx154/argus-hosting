@@ -35,4 +35,4 @@ node frontend/workspace/build.mjs
 
 脚本复制构建所需源码到暂存目录，检查并应用补丁，安装 Argus 网页锁定的依赖，运行托管网页测试，再以 `VITE_ARGUS_HOSTED_TRIAL=1` 构建。输出路径是 `$ARGUS_HOSTING_WEB_STAGE/frontend/web/dist`，将服务端普通用户资产配置 `frontend_dir` 指向它。Argus 源目录不被修改，补丁不匹配时构建停止。要重跑，请另给一个新的暂存目录。托管桌面装配也可在它自己的 Argus 源码副本中、构建网页前应用同一补丁，无须把策略放回 Argus。
 
-`admin-data/dist` 与托管用户网页 dist 是两份资产，发布时分别配置。两者都不提交仓库；具体安装、服务启动和发布步骤见最终部署文档。
+`admin-data/dist` 与托管用户网页 dist 是两份资产，发布时分别配置。两者都不提交仓库；具体安装、服务启动和发布步骤见 [部署文档](../docs/deployment.md)。
