@@ -1,0 +1,969 @@
+--- a/desktop-tauri/src-tauri/src/lib.rs
++++ b/desktop-tauri/src-tauri/src/lib.rs
+@@ -11,6 +11,7 @@
+ mod resilience;
+ mod runner;
+ mod settings;
++mod trial;
+ mod update_install;
+ mod update_policy;
+ mod updater;
+@@ -360,6 +361,7 @@
+         .as_ref()
+         .map(|runner| runner.kind.clone())
+         .unwrap_or_else(|| settings.runner_kind.clone());
++    let can_restore_own_account = settings.own_account.as_ref().is_some_and(|own| own.setup_complete);
+     let mut runner_bins = settings.runner_bins;
+     if let Some(executable) = configured
+         .as_ref()
+@@ -369,6 +371,8 @@
+     }
+     Ok(DesktopSetup {
+         complete,
++        trial_mode: settings.trial_mode,
++        can_restore_own_account,
+         host: settings.host,
+         port: settings.port,
+         runner_kind,
+@@ -463,7 +467,68 @@
+     let Ok(_operation) = app_state.configuration_operation.try_lock() else {
+         return SetupResult::error("正在更新本地服务，请稍候再试。");
+     };
+-    let result = apply_setup(&app, input).await;
++    let result = apply_setup(&app, input, false).await;
++    if !result.ok { recover_previous_runtime(&app).await; }
++    result
++}
++
++#[tauri::command]
++async fn complete_trial_setup(app: AppHandle, input: trial::TrialSetupInput) -> SetupResult {
++    let app_state = state(&app);
++    let Ok(_operation) = app_state.configuration_operation.try_lock() else {
++        return SetupResult::error("正在准备试用，请稍候。");
++    };
++    let prepared = match trial::configure(&app, &make_release_context(&app), input.api_key.trim()).await {
++        Ok(value) => value, Err(error) => return SetupResult::error(error),
++    };
++    let settings = app_state.settings.snapshot();
++    let mut profile = match trial::ProfileChange::begin(input.api_key.trim()) {
++        Ok(value) => value, Err(error) => return SetupResult::error(error),
++    };
++    let mut bins = settings.runner_bins;
++    bins.insert("copilot".to_owned(), prepared.runner_bin);
++    let result = apply_setup(&app, CompleteSetupInput {
++        port: settings.port as u32, runner_kind: models::RunnerKind::Copilot, runner_bins: bins,
++    }, true).await;
++    if result.ok {
++        profile.commit();
++        trial::cache_balance(&prepared.balance);
++    } else {
++        if let Err(error) = profile.rollback() { return SetupResult::error(error); }
++        recover_previous_runtime(&app).await;
++    }
++    result
++}
++
++#[tauri::command]
++async fn get_trial_status(app: AppHandle) -> Result<trial::TrialBalance, String> {
++    let app_state = state(&app);
++    let _operation = app_state.configuration_operation.try_lock().map_err(|_| "正在更新设置，请稍候。")?;
++    if !app_state.settings.snapshot().trial_mode { return Err("当前使用自己的账号。".to_owned()); }
++    trial::status(&app, &make_release_context(&app), false).await
++}
++
++#[tauri::command]
++async fn resume_trial(app: AppHandle) -> Result<trial::TrialBalance, String> {
++    let app_state = state(&app);
++    let _operation = app_state.configuration_operation.try_lock().map_err(|_| "正在更新设置，请稍候。")?;
++    if !app_state.settings.snapshot().trial_mode { return Err("当前使用自己的账号。".to_owned()); }
++    trial::status(&app, &make_release_context(&app), true).await
++}
++
++#[tauri::command]
++async fn restore_own_account(app: AppHandle) -> SetupResult {
++    let app_state = state(&app);
++    let Ok(_operation) = app_state.configuration_operation.try_lock() else {
++        return SetupResult::error("正在更新本地服务，请稍候。");
++    };
++    let settings = app_state.settings.snapshot();
++    let Some(own) = settings.own_account else {
++        return SetupResult::error("没有已保存的原账号设置，请在设置中选择自己的 Agent CLI。");
++    };
++    let result = apply_setup(&app, CompleteSetupInput {
++        port: settings.port as u32, runner_kind: own.runner_kind, runner_bins: own.runner_bins,
++    }, false).await;
+     if !result.ok { recover_previous_runtime(&app).await; }
+     result
+ }
+@@ -476,18 +541,28 @@
+     }
+ }
+ 
+-async fn apply_setup(app: &AppHandle, input: CompleteSetupInput) -> SetupResult {
++async fn apply_setup(app: &AppHandle, input: CompleteSetupInput, trial_mode: bool) -> SetupResult {
+     if !(1024..=65535).contains(&input.port) {
+         return SetupResult::error("端口需在 1024 - 65535 之间");
+     }
+     let app_state = state(app);
+     let previous = app_state.settings.snapshot();
+     let mut next = previous.clone();
++    if trial_mode && !previous.trial_mode {
++        next.own_account = Some(models::OwnAccountSettings {
++            runner_kind: previous.runner_kind.clone(), runner_bins: previous.runner_bins.clone(),
++            runner_configured: previous.runner_configured, setup_complete: previous.setup_complete,
++        });
++    } else if !trial_mode {
++        next.own_account = None;
++    }
++    next.trial_mode = trial_mode;
+     next.port = input.port as u16;
+     next.runner_kind = input.runner_kind;
+     next.runner_bins = normalized_runner_bins(&input.runner_bins);
+     next.runner_configured = true;
+     next.setup_complete = true;
++    next.trial_mode = trial_mode;
+     let configured = match resolve_runner_configuration(&next) {
+         Ok(configured) => configured,
+         Err(error) => return SetupResult::error(error.to_string()),
+@@ -506,11 +581,14 @@
+             return SetupResult::error(error);
+         }
+     }
+-    let runtime_changed = previous.port != next.port
++    // Replacing a key restarts the runtime so no worker keeps the old provider environment.
++    let runtime_changed = trial_mode || previous.trial_mode != next.trial_mode || previous.port != next.port
+         || previous.runner_kind != next.runner_kind
+         || previous.runner_configured != next.runner_configured
+         || previous.runner_bins != next.runner_bins;
+-    if previous.port != next.port || app_state.supervisor.current_status().state != BackendState::Ready
++    // Trial startup chooses a free port without taking over a foreign listener.
++    if !trial_mode
++        && (previous.port != next.port || app_state.supervisor.current_status().state != BackendState::Ready)
+     {
+         if let Err(error) = available_backend_port(&next) {
+             return SetupResult::error(format!("端口 {} 已被占用或不可用，请选择其他端口。现有设置未更改。{error}", next.port));
+@@ -819,6 +897,10 @@
+         choose_runner,
+         choose_local_path,
+         complete_setup,
++        complete_trial_setup,
++        get_trial_status,
++        resume_trial,
++        restore_own_account,
+         restart_backend,
+         export_diagnostics,
+         hide_desktop,
+--- a/desktop-tauri/src-tauri/src/backend.rs
++++ b/desktop-tauri/src-tauri/src/backend.rs
+@@ -235,7 +235,7 @@
+             runtime.stopping = false;
+             runtime.lifecycle_generation
+         };
+-        let settings = self.inner.settings.snapshot();
++        let mut settings = self.inner.settings.snapshot();
+         let configured = match resolve_runner_configuration(&settings) {
+             Ok(configured) => configured,
+             Err(error) => {
+@@ -247,7 +247,7 @@
+             self.set_status(BackendState::Idle, "请选择并确认 Agent CLI 后开始使用", None);
+             return;
+         }
+-        let command = match self.resolve_command(&settings) {
++        let mut command = match self.resolve_command(&settings) {
+             Ok(command) => command,
+             Err(error) => {
+                 self.set_status(
+@@ -281,24 +281,26 @@
+                 self.mark_backend_ready(generation, "本地服务已就绪");
+                 return;
+             }
+-            self.set_status(
+-                BackendState::Error,
+-                format!(
+-                    "端口 {} 已由未受当前桌面进程管理的应用占用",
+-                    settings.port
+-                ),
+-                Some(
+-                    "请先正常退出另一份应用；桌面端不会接管或终止无法证明所有权的进程。"
+-                        .to_owned(),
+-                ),
+-            );
+-            return;
++            if !settings.trial_mode {
++                self.set_status(
++                    BackendState::Error,
++                    format!(
++                        "端口 {} 已由未受当前桌面进程管理的应用占用",
++                        settings.port
++                    ),
++                    Some(
++                        "请先正常退出另一份应用；桌面端不会接管或终止无法证明所有权的进程。"
++                            .to_owned(),
++                    ),
++                );
++                return;
++            }
+         }
+ 
+         if probe.occupied {
+             let may_replace = self.prior_ownership_matches(&probe, &settings)
+                 || self.legacy_bundled_backend_matches(&probe, &command);
+-            if !may_replace {
++            if !may_replace && !settings.trial_mode {
+                 self.set_status(
+                     BackendState::Error,
+                     format!("端口 {} 已被其他程序占用", settings.port),
+@@ -326,6 +328,31 @@
+             }
+             if !self.is_current_generation(generation) {
+                 return;
++            }
++        }
++
++        if settings.trial_mode {
++            let prepared = self
++                .inner
++                .settings
++                .prepare_backend_port()
++                .and_then(|settings| {
++                    self.resolve_command(&settings)
++                        .map(|command| (settings, command))
++                });
++            match prepared {
++                Ok((selected_settings, selected_command)) => {
++                    settings = selected_settings;
++                    command = selected_command;
++                }
++                Err(error) => {
++                    self.set_status(
++                        BackendState::Error,
++                        "无法准备本地服务端口",
++                        Some(format!("{error:#}")),
++                    );
++                    return;
++                }
+             }
+         }
+ 
+@@ -960,8 +987,20 @@
+                 "PYTHONIOENCODING",
+                 env::var("PYTHONIOENCODING").unwrap_or_else(|_| "utf-8".to_owned()),
+             );
++        if settings.trial_mode {
++            // Desktop trial is an environment-scoped profile; the user's
++            // persistent model/role knobs are not rewritten when switching.
++            process.env("ARGUS_SKILL_MODEL", "argus-trial")
++                .env("ARGUS_SKILL_LIFE_BACKEND", "copilot")
++                .env("ARGUS_SKILL_BACKEND_AUTH_MODE", "subscription_cli");
++        }
++        process.env_remove("ARGUS_DESKTOP_TRIAL_PROFILE");
+         if settings.runner_configured {
+             process
++                .env(
++                    "ARGUS_SKILL_COPILOT_TRIAL",
++                    if settings.trial_mode { "1" } else { "0" },
++                )
+                 .env("ARGUS_SKILL_RUNNER_BACKEND", settings.runner_kind.as_str())
+                 .env_remove("ARGUS_SKILL_RUNNER_BIN");
+         }
+--- a/desktop-tauri/src-tauri/src/models.rs
++++ b/desktop-tauri/src-tauri/src/models.rs
+@@ -61,6 +61,15 @@
+ 
+ #[derive(Clone, Debug, Deserialize, Serialize)]
+ #[serde(rename_all = "camelCase")]
++pub struct OwnAccountSettings {
++    pub runner_kind: RunnerKind,
++    pub runner_bins: BTreeMap<String, String>,
++    pub runner_configured: bool,
++    pub setup_complete: bool,
++}
++
++#[derive(Clone, Debug, Deserialize, Serialize)]
++#[serde(rename_all = "camelCase")]
+ pub struct DesktopSettings {
+     #[serde(default = "default_host")]
+     pub host: String,
+@@ -76,6 +85,10 @@
+     pub runner_configured: bool,
+     #[serde(default)]
+     pub setup_complete: bool,
++    #[serde(default)]
++    pub trial_mode: bool,
++    #[serde(default)]
++    pub own_account: Option<OwnAccountSettings>,
+     #[serde(default)]
+     pub appearance_theme: AppearanceTheme,
+ }
+@@ -98,6 +111,8 @@
+             runner_bins: BTreeMap::new(),
+             runner_configured: false,
+             setup_complete: false,
++            trial_mode: false,
++            own_account: None,
+             appearance_theme: AppearanceTheme::default(),
+         }
+     }
+@@ -176,6 +191,8 @@
+ #[serde(rename_all = "camelCase")]
+ pub struct DesktopSetup {
+     pub complete: bool,
++    pub trial_mode: bool,
++    pub can_restore_own_account: bool,
+     pub host: String,
+     pub port: u16,
+     pub runner_kind: RunnerKind,
+--- a/desktop-tauri/src-tauri/src/settings.rs
++++ b/desktop-tauri/src-tauri/src/settings.rs
+@@ -101,6 +101,19 @@
+         Ok(())
+     }
+ 
++    pub fn prepare_backend_port(&self) -> anyhow::Result<DesktopSettings> {
++        let mut current = self.settings.lock().expect("settings mutex poisoned");
++        let port = available_backend_port(&current)
++            .with_context(|| format!("无法准备本地服务端口 {}", current.port))?;
++        if port != current.port {
++            let mut next = current.clone();
++            next.port = port;
++            self.write_settings(&next)?;
++            *current = next;
++        }
++        Ok(current.clone())
++    }
++
+     pub fn set_appearance(&self, theme: AppearanceTheme) -> anyhow::Result<DesktopAppearance> {
+         {
+             let mut current = self.settings.lock().expect("settings mutex poisoned");
+@@ -165,7 +178,13 @@
+ }
+ 
+ pub fn available_backend_port(settings: &DesktopSettings) -> io::Result<u16> {
+-    let listener = TcpListener::bind((settings.host.as_str(), settings.port))?;
++    let listener = match TcpListener::bind((settings.host.as_str(), settings.port)) {
++        Ok(listener) => listener,
++        Err(error) if settings.trial_mode && error.kind() == io::ErrorKind::AddrInUse => {
++            TcpListener::bind((settings.host.as_str(), 0))?
++        }
++        Err(error) => return Err(error),
++    };
+     listener.local_addr().map(|address| address.port())
+ }
+ 
+@@ -316,17 +335,19 @@
+     use std::{
+         collections::BTreeMap,
+         io,
+-        net::TcpListener,
++        net::{TcpListener, TcpStream},
+         sync::Mutex,
++        time::{Duration, Instant},
+     };
+ 
+-    fn port_store(port: u16) -> (tempfile::TempDir, SettingsStore) {
++    fn port_store(port: u16, trial_mode: bool) -> (tempfile::TempDir, SettingsStore) {
+         let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+         let store = SettingsStore {
+             data_dir: directory.path().to_path_buf(),
+             settings_path: directory.path().join("settings.json"),
+             settings: Mutex::new(DesktopSettings {
+                 port,
++                trial_mode,
+                 token: "test-web-token".into(),
+                 runner_configured: true,
+                 setup_complete: true,
+@@ -358,20 +379,100 @@
+     }
+ 
+     #[test]
++    fn trial_port_collision_and_restart_preserve_foreign_listeners_and_saved_urls() {
++        let foreign = TcpListener::bind(("127.0.0.1", 0)).unwrap();
++        let (_directory, store) = port_store(foreign.local_addr().unwrap().port(), true);
++        let mut listeners = vec![foreign];
++        // Startup avoids the preferred port; restart avoids the now-occupied saved port.
++        for _ in 0..2 {
++            let preferred = store.snapshot().port;
++            let selected = store.prepare_backend_port().unwrap();
++            assert_ne!(selected.port, preferred);
++            assert_ne!(selected.port, 0);
++            assert_eq!(store.snapshot().port, selected.port);
++            let (saved, _) = super::load_settings_file(&store.settings_path).unwrap();
++            assert_eq!(saved.port, selected.port);
++            assert!(saved.trial_mode && saved.setup_complete && saved.runner_configured);
++            assert_eq!(saved.token, "test-web-token");
++            let cockpit = url::Url::parse(&SettingsStore::cockpit_url(&saved)).unwrap();
++            assert_eq!(cockpit.host_str(), Some("127.0.0.1"));
++            assert_eq!(cockpit.port(), Some(selected.port));
++            assert!(cockpit
++                .query_pairs()
++                .any(|(key, value)| key == "token" && value == saved.token));
++            assert_eq!(
++                SettingsStore::api_base_url(&saved),
++                format!("http://127.0.0.1:{}", selected.port)
++            );
++            // The selected port can be bound, while every foreign listener remains reachable.
++            listeners.push(TcpListener::bind((selected.host.as_str(), selected.port)).unwrap());
++            for listener in &listeners {
++                listener.set_nonblocking(true).unwrap();
++                let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
++                // A successful connect can precede accept readiness on macOS.
++                // Wait for the nonblocking listener without hiding real errors.
++                let deadline = Instant::now() + Duration::from_secs(5);
++                let (connection, _) = loop {
++                    match listener.accept() {
++                        Ok(connection) => break connection,
++                        Err(error)
++                            if error.kind() == io::ErrorKind::WouldBlock
++                                && Instant::now() < deadline =>
++                        {
++                            std::thread::sleep(Duration::from_millis(5));
++                        }
++                        Err(error) => panic!("foreign listener accept failed: {error}"),
++                    }
++                };
++                assert_eq!(connection.local_addr().unwrap(), client.peer_addr().unwrap());
++            }
++        }
++    }
++
++    #[test]
++    fn trial_port_keeps_an_available_preference() {
++        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
++        let port = listener.local_addr().unwrap().port();
++        drop(listener);
++        let (_directory, store) = port_store(port, true);
++        assert_eq!(store.prepare_backend_port().unwrap().port, port);
++        assert_eq!(
++            super::load_settings_file(&store.settings_path).unwrap().0.port,
++            port
++        );
++    }
++
++    #[test]
+     fn manual_port_choices_are_never_reassigned() {
+         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+         let port = listener.local_addr().unwrap().port();
+-        let (_directory, store) = port_store(port);
++        let (_directory, store) = port_store(port, false);
+         let original = std::fs::read(&store.settings_path).unwrap();
+-        let error = super::available_backend_port(&store.snapshot()).unwrap_err();
++        let error = store.prepare_backend_port().unwrap_err();
+         assert_eq!(
+-            error.kind(),
++            error.downcast_ref::<io::Error>().unwrap().kind(),
+             io::ErrorKind::AddrInUse
+         );
+         assert_eq!(store.snapshot().port, port);
+         assert_eq!(std::fs::read(&store.settings_path).unwrap(), original);
+         drop(listener);
+-        assert_eq!(super::available_backend_port(&store.snapshot()).unwrap(), port);
++        assert_eq!(store.prepare_backend_port().unwrap().port, port);
++    }
++
++    #[test]
++    fn trial_port_save_failure_does_not_publish_an_unsaved_port() {
++        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
++        let port = listener.local_addr().unwrap().port();
++        let (_directory, mut store) = port_store(port, true);
++        let original = std::fs::read(&store.settings_path).unwrap();
++        store.settings_path = store.data_dir.join("blocked");
++        std::fs::create_dir(&store.settings_path).unwrap();
++        assert!(store.prepare_backend_port().is_err());
++        assert_eq!(store.snapshot().port, port);
++        assert_eq!(
++            std::fs::read(store.data_dir.join("settings.json")).unwrap(),
++            original
++        );
+     }
+ 
+     #[test]
+--- a/desktop-tauri/src-tauri/src/core_tests.rs
++++ b/desktop-tauri/src-tauri/src/core_tests.rs
+@@ -34,3 +34,6 @@
+         assert!(frames.split_whitespace().any(|source| source == "blob:"));
+     }
+ }
++
++#[path = "trial.rs"]
++mod trial;
+--- a/desktop-tauri/src/main.ts
++++ b/desktop-tauri/src/main.ts
+@@ -12,6 +12,7 @@
+   type DesktopStatus,
+   type PiConfiguration,
+   type RunnerKind,
++  type TrialDownloadProgress,
+   type UpdateStatus,
+ } from './bridge';
+ 
+@@ -87,6 +88,29 @@
+ const wizardBack = document.getElementById('wizardBack') as HTMLButtonElement;
+ const wizardNext = document.getElementById('wizardNext') as HTMLButtonElement;
+ const wizardFinish = document.getElementById('wizardFinish') as HTMLButtonElement;
++const trialOpen = document.getElementById('trialOpen') as HTMLButtonElement;
++const ownOpen = document.getElementById('ownOpen') as HTMLButtonElement;
++const trialPanel = document.getElementById('trialPanel') as HTMLElement;
++const ownIntro = document.getElementById('ownIntro') as HTMLElement;
++const ownContent = document.getElementById('ownContent') as HTMLElement;
++const trialForm = document.getElementById('trialForm') as HTMLFormElement;
++const trialKey = document.getElementById('trialKey') as HTMLInputElement;
++const trialSubmit = document.getElementById('trialSubmit') as HTMLButtonElement;
++const trialProgress = document.getElementById('trialProgress') as HTMLParagraphElement;
++const trialShortcut = document.getElementById('trialShortcut') as HTMLButtonElement;
++let trialBusy = false;
++let trialMode = false;
++const trialAccount = document.getElementById('trialAccount') as HTMLElement;
++const trialBalance = document.getElementById('trialBalance') as HTMLElement;
++const trialRefresh = document.getElementById('trialRefresh') as HTMLButtonElement;
++const trialRestore = document.getElementById('trialRestore') as HTMLButtonElement;
++const trialResume = document.getElementById('trialResume') as HTMLButtonElement;
++const trialAttention = document.getElementById('trialAttention') as HTMLElement;
++const trialDownload = document.getElementById('trialDownload') as HTMLDivElement;
++const trialDownloadBar = document.getElementById('trialDownloadBar') as HTMLProgressElement;
++const trialDownloadDetails = document.getElementById('trialDownloadDetails') as HTMLParagraphElement;
++const trialNetworkHint = document.getElementById('trialNetworkHint') as HTMLParagraphElement;
++let trialDownloadTimer: ReturnType<typeof setTimeout> | undefined;
+ 
+ const cockpitEl = document.getElementById('cockpit') as HTMLElement;
+ const cockpitFrame = document.getElementById('cockpitFrame') as HTMLIFrameElement;
+@@ -344,6 +368,7 @@
+ }
+ 
+ function render(status: DesktopStatus): void {
++  if (trialBusy) return;
+   document.body.dataset.state = status.state;
+   runtimeNotice.hidden = !status.warning;
+   runtimeNoticeDetail.textContent = status.warning || '';
+@@ -535,10 +560,16 @@
+   wizardCancel.hidden = !cockpitMounted;
+   wizardEl.dataset.returnAvailable = String(cockpitMounted);
+   applySetup(setup);
++  trialKey.value = '';
++  trialMode = !!setup.trialMode;
++  trialAccount.hidden = !trialMode;
++  trialRestore.hidden = !setup.canRestoreOwnAccount;
++  if (trialMode) void refreshTrialBalance();
++  trialProgress.textContent = '';
+   portInput.value = String(port);
+   renderRunnerKind();
+   renderRunner();
+-  goToStep(0);
++  selectEntryMode(trialMode ? 'trial' : 'own');
+ }
+ 
+ async function reopenWizard(): Promise<void> {
+@@ -564,6 +595,7 @@
+   splashEl.classList.remove('has-wizard');
+   document.documentElement.dataset.settingsMode = 'false';
+   setupRequested = false;
++  trialKey.value = '';
+   returnFocus?.focus();
+   if (cockpitLoaded && !splashEl.hidden) void hideSplashAfterCockpitLoad();
+ }
+@@ -740,6 +772,141 @@
+ 
+ setupEl.addEventListener('click', () => void reopenWizard());
+ 
++async function refreshTrialBalance(): Promise<void> {
++  if (!trialMode || trialRefresh.disabled) return;
++  trialRefresh.disabled = true;
++  const result = await capture(() => desktopBridge.getTrialStatus());
++  trialRefresh.disabled = false;
++  if (!result.ok) { trialBalance.textContent = '余额暂未同步，请检查网络后刷新。'; return; }
++  const balance = result.value;
++  trialResume.hidden = !balance.paused;
++  trialAttention.hidden = !balance.attention;
++  trialAttention.textContent = balance.attention || '';
++  if (typeof balance.tokensRemaining !== 'number' || typeof balance.tokenLimit !== 'number') {
++    trialBalance.textContent = balance.error || '余额暂未同步，请稍后刷新。';
++    return;
++  }
++  const at = balance.checkedAt ? new Date(balance.checkedAt * 1000).toLocaleString() : '';
++  trialBalance.textContent = `${balance.stale ? '上次同步' : '剩余额度'}：${balance.tokensRemaining.toLocaleString()} / ${balance.tokenLimit.toLocaleString()} token${at ? ` · ${at}` : ''}${balance.stale ? '（当前未同步）' : ''}`;
++}
++trialRefresh.addEventListener('click', () => void refreshTrialBalance());
++trialResume.addEventListener('click', async () => {
++  if (applying || !window.confirm('中断的请求可能已经扣除预留额度。查询余额并解除试用暂停？不会自动重放已失败任务。')) return;
++  trialResume.disabled = true;
++  const result = await capture(() => desktopBridge.resumeTrial());
++  trialResume.disabled = false;
++  if (!result.ok || result.value.error) {
++    trialAttention.hidden = false;
++    trialAttention.textContent = result.ok ? result.value.error || '恢复失败。' : '无法连接本地服务。';
++    return;
++  }
++  await refreshTrialBalance();
++});
++trialRestore.addEventListener('click', async () => {
++  if (applying || !window.confirm('切回原账号会重启本地后端，请确认正在进行的任务已暂停。')) return;
++  applying = trialBusy = true;
++  trialRestore.disabled = true;
++  const result = await capture(() => desktopBridge.restoreOwnAccount());
++  applying = trialBusy = false;
++  trialRestore.disabled = false;
++  if (!result.ok || !result.value.ok) {
++    trialBalance.textContent = result.ok ? result.value.error || '切换失败，原设置已保留。' : '无法连接本地设置服务。';
++    return;
++  }
++  trialMode = false;
++  closeWizard();
++  const status = await capture(() => desktopBridge.getStatus());
++  if (status.ok) render(status.value);
++});
++
++function selectEntryMode(mode: 'own' | 'trial', focusInput = false): void {
++  const trial = mode === 'trial';
++  goToStep(0);
++  trialPanel.hidden = !trial;
++  trialForm.hidden = !trial;
++  ownIntro.hidden = trial;
++  ownContent.hidden = trial;
++  wizardEl.classList.toggle('trial-entry-active', trial);
++  stepperEl.hidden = trial;
++  trialOpen.setAttribute('aria-pressed', String(trial));
++  trialOpen.setAttribute('aria-expanded', String(trial));
++  ownOpen.setAttribute('aria-pressed', String(!trial));
++  wizardCaption.textContent = trial ? '内测试用' : '使用自己的账号';
++  wizardBody.scrollTop = 0;
++  if (!trial) { trialKey.value = ''; trialProgress.textContent = ''; resetTrialDownload(); }
++  if (trial && focusInput) trialKey.focus();
++}
++ownOpen.addEventListener('click', () => { if (!applying) selectEntryMode('own'); });
++trialOpen.addEventListener('click', () => { if (!applying) selectEntryMode('trial', true); });
++async function openTrialSettings(): Promise<void> {
++  await reopenWizard();
++  if (wizardOpen && !applying) selectEntryMode('trial', true);
++}
++trialShortcut.addEventListener('click', () => void openTrialSettings());
++function resetTrialDownload(): void {
++  clearTimeout(trialDownloadTimer);
++  trialDownloadTimer = undefined;
++  trialDownload.hidden = true;
++  trialNetworkHint.hidden = true;
++  trialDownloadBar.removeAttribute('value');
++  trialDownloadDetails.textContent = '';
++}
++function renderTrialDownload({ downloaded_bytes: downloaded, total_bytes: total }: TrialDownloadProgress): void {
++  if (!trialBusy || !Number.isFinite(downloaded) || downloaded < 0) return;
++  clearTimeout(trialDownloadTimer);
++  trialNetworkHint.hidden = true;
++  trialDownload.hidden = false;
++  const megabytes = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
++  if (total !== null && Number.isFinite(total) && total > 0) {
++    const percent = Math.min(100, Math.floor(downloaded / total * 100));
++    trialDownloadBar.value = percent;
++    trialDownloadDetails.textContent = `${percent}% · ${megabytes(downloaded)} / ${megabytes(total)}`;
++  } else {
++    trialDownloadBar.removeAttribute('value');
++    trialDownloadDetails.textContent = downloaded > 0 ? `已接收 ${megabytes(downloaded)}` : '正在连接下载服务器…';
++  }
++  trialDownloadTimer = setTimeout(() => { trialNetworkHint.hidden = false; }, 30_000);
++}
++desktopBridge.onTrialDownload?.(renderTrialDownload);
++desktopBridge.onTrialProgress((message) => {
++  if (!trialBusy) return;
++  resetTrialDownload();
++  trialProgress.textContent = message;
++});
++trialForm.addEventListener('submit', async (event) => {
++  event.preventDefault();
++  if (applying) return;
++  const key = trialKey.value.trim();
++  if (!/^argus_trial_[a-f0-9]{64}$/.test(key)) {
++    trialProgress.textContent = '请输入完整的内部测试 Key。';
++    trialKey.focus();
++    return;
++  }
++  if (cockpitMounted && !window.confirm('启用或更换试用 Key 会重启本地后端。确认当前任务已暂停并继续？')) return;
++  applying = trialBusy = true;
++  trialKey.value = '';
++  trialKey.disabled = trialSubmit.disabled = true;
++  wizardEl.setAttribute('aria-busy', 'true');
++  trialSubmit.textContent = '正在准备…';
++  trialProgress.textContent = '正在验证 Key…';
++  const result = await capture(() => desktopBridge.completeTrialSetup(key));
++  resetTrialDownload();
++  applying = trialBusy = false;
++  trialKey.disabled = trialSubmit.disabled = false;
++  wizardEl.removeAttribute('aria-busy');
++  trialSubmit.textContent = '开始试用';
++  if (!result.ok || !result.value.ok) {
++    // Never reflect raw IPC errors, which could contain serialized input.
++    trialProgress.textContent = result.ok ? (result.value.error || '配置失败，请重试。') : '无法连接本地安装服务，请重试。';
++    return;
++  }
++  trialMode = true;
++  closeWizard();
++  const status = await capture(() => desktopBridge.getStatus());
++  if (status.ok) render(status.value);
++  else renderIpcFailure('无法读取本地服务状态', status.detail);
++});
++
+ diagnosticsEl.addEventListener('click', () => {
+   diagnosticsEl.disabled = true;
+   void capture(() => desktopBridge.exportDiagnostics()).then((result) => {
+@@ -976,6 +1143,7 @@
+   const type = (data as { type?: unknown }).type;
+   const payload = (data as { payload?: unknown }).payload;
+   if (type === 'argus:show-setup') void reopenWizard();
++  if (type === 'argus:show-trial-setup') void openTrialSettings();
+   if (type === 'argus:request-new-chat' && !wizardOpen) postToCockpit('argus:new-chat');
+   if (type === 'argus:cockpit-interaction') closeDesktopMenus();
+   if (type === 'argus:notify-delivery' || type === 'argus:notify-completion') {
+--- a/desktop-tauri/src/bridge.ts
++++ b/desktop-tauri/src/bridge.ts
+@@ -44,6 +44,8 @@
+ 
+ export interface DesktopSetup {
+   complete: boolean;
++  trialMode: boolean;
++  canRestoreOwnAccount?: boolean;
+   host: string;
+   port: number;
+   runnerKind: RunnerKind;
+@@ -58,6 +60,17 @@
+ export interface DesktopAppearance {
+   theme: AppearanceTheme;
+   resolvedTheme: 'light' | 'dark';
++}
++
++export interface TrialBalance {
++  tokensRemaining?: number | null;
++  tokenLimit?: number | null;
++  tokensUsed?: number | null;
++  checkedAt?: number | null;
++  stale: boolean;
++  error?: string | null;
++  paused?: boolean;
++  attention?: string | null;
+ }
+ 
+ export interface SetupResult {
+@@ -111,11 +124,25 @@
+   };
+ }
+ 
++export interface TrialDownloadProgress {
++  downloaded_bytes: number;
++  total_bytes: number | null;
++}
++
+ export const desktopBridge = {
+   getStatus: (): Promise<DesktopStatus> => invoke('get_status'),
+   onStatus: (callback: (status: DesktopStatus) => void): (() => void) =>
+     eventSubscription('argus:status', callback),
+   getSetup: (): Promise<DesktopSetup> => invoke('get_setup'),
++  completeTrialSetup: (apiKey: string): Promise<SetupResult> =>
++    invoke('complete_trial_setup', { input: { apiKey } }),
++  getTrialStatus: (): Promise<TrialBalance> => invoke('get_trial_status'),
++  resumeTrial: (): Promise<TrialBalance> => invoke('resume_trial'),
++  restoreOwnAccount: (): Promise<SetupResult> => invoke('restore_own_account'),
++  onTrialProgress: (callback: (message: string) => void): (() => void) =>
++    eventSubscription('argus:trial-progress', callback),
++  onTrialDownload: (callback: (progress: TrialDownloadProgress) => void): (() => void) =>
++    eventSubscription('argus:trial-download', callback),
+   getAppearance: (): Promise<DesktopAppearance> => invoke('get_appearance'),
+   setAppearance: (appearance: { theme: AppearanceTheme }): Promise<DesktopAppearance> =>
+     invoke('set_appearance', { input: appearance }),
+--- a/desktop-tauri/src/index.html
++++ b/desktop-tauri/src/index.html
+@@ -105,6 +105,7 @@
+             重试
+           </button>
+           <button class="setup" id="setup" type="button" hidden>修改设置</button>
++          <button class="setup" id="trialShortcut" type="button">使用内部测试 Key</button>
+           <button class="setup" id="diagnostics" type="button" hidden>导出脱敏诊断</button>
+         </div>
+       </section>
+@@ -164,6 +165,48 @@
+ 
+         <div class="wizard-body">
+           <section class="panel" data-panel="env">
++            <div class="entry-modes" role="group" aria-label="选择使用方式">
++              <button id="ownOpen" class="entry-mode" type="button" aria-pressed="true" aria-controls="ownIntro ownContent">
++                <strong>使用自己的账号</strong><span>选择已安装并登录的 Agent CLI</span>
++              </button>
++              <button id="trialOpen" class="entry-mode" type="button" aria-pressed="false" aria-expanded="false" aria-controls="trialPanel">
++                <strong>使用内测 Key</strong><span>受邀试用，自动准备运行环境</span>
++              </button>
++            </div>
++            <section id="trialPanel" class="trial-invite" aria-labelledby="trialHeading" hidden>
++              <h3 id="trialHeading">内部试用</h3>
++              <p>如果您拿到了内部测试 Key，可以直接在这里填入使用。</p>
++              <div id="trialAccount" class="trial-account" hidden>
++                <strong>当前使用：服务端托管模型</strong>
++                <p id="trialBalance" role="status">正在同步服务端余额…</p>
++                <p id="trialAttention" role="status" hidden></p>
++                <div class="trial-account-actions">
++                  <button id="trialRefresh" class="ghost small" type="button">刷新余额</button>
++                  <button id="trialResume" class="ghost small" type="button" hidden>核对余额并恢复试用</button>
++                  <button id="trialRestore" class="ghost small" type="button" hidden>切回原账号</button>
++                </div>
++              </div>
++              <form id="trialForm" hidden>
++                <label for="trialKey">内部测试 Key</label>
++                <div class="trial-input-row">
++                  <input id="trialKey" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴 argus_trial_ 开头的 Key" required aria-describedby="trialHelp trialProgress">
++                  <button class="primary" id="trialSubmit" type="submit">开始试用</button>
++                </div>
++                <p id="trialHelp">无需其他 Coding 账号 · 每个 Key 累计 100 万 token · 跨设备共享余额</p>
++                <p id="trialProgress" role="status" aria-live="polite"></p>
++                <div id="trialDownload" hidden>
++                  <progress id="trialDownloadBar" max="100" aria-label="Copilot 下载进度"></progress>
++                  <p id="trialDownloadDetails"></p>
++                </div>
++                <p id="trialNetworkHint" role="status" hidden>下载暂时没有进展。请检查网络或系统代理；下载失败后可手动重试。</p>
++                <details class="trial-details">
++                  <summary>准备过程、额度与隐私说明</summary>
++                  <p>首次需要连接 GitHub 和试用服务。真实模型验证消耗少量额度；余额包含在途预留，中断也可能扣额度。</p>
++                  <p>启用或更换 Key 会重启本地后端，请先暂停正在进行的任务。argus-trial 是通信别名，真实模型由服务端运行配置决定。</p>
++                  <p>请求经过 Cloudflare、Argus 网关和上游服务，并非端到端加密或完全离线。</p>
++                </details>
++              </form>
++            </section>
+             <div id="ownIntro" class="panel-intro">
+               <h3>选择 Agent CLI</h3>
+               <p>使用自己的账号与模型。确认后自动记住，下次直接进入工作台。</p>
+--- a/desktop-tauri/src/style.css
++++ b/desktop-tauri/src/style.css
+@@ -666,6 +666,17 @@
+   box-shadow: 0 28px 80px -46px var(--shadow);
+ }
+ 
++:root[data-settings-mode='true'] .panel[data-panel='env'] > .trial-invite {
++  grid-column: 1 / -1;
++  margin: 0;
++  border-width: 0 0 1px;
++  border-radius: 0;
++}
++
++:root[data-settings-mode='true'] .wizard.trial-entry-active .panel[data-panel='env'] {
++  min-height: 0;
++}
++
+ :root[data-settings-mode='true'] .panel-intro {
+   margin: 0;
+   padding: 38px 32px;
+@@ -1480,15 +1491,68 @@
+   }
+ }
+ 
++/* One account mode at a time. The choice row is not a third grid column
++ * inside the old full-window settings layout. */
++.entry-modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
++.entry-mode { display: flex; min-width: 0; flex-direction: column; gap: 5px; align-items: flex-start; padding: 13px 16px; text-align: left; border: 1px solid var(--line); border-radius: 9px; background: var(--tile); color: var(--ink); }
++.entry-mode strong { font-size: 14px; font-weight: 600; }
++.entry-mode span { font-size: 11px; line-height: 1.5; color: var(--muted); }
++.entry-mode:hover { border-color: var(--line-strong); }
++.entry-mode[aria-pressed='true'] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 5%, var(--tile)); }
++.entry-mode:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
++#ownIntro { display: block; margin: 0 0 13px; padding: 0; background: none; border: 0; }
++#ownIntro h3, .trial-invite h3 { margin: 0; font-size: 16px; }
++#ownIntro p { max-width: none; margin: 5px 0 0; font-size: 12px; line-height: 1.5; }
++#ownContent { min-width: 0; padding: 0; gap: 10px; }
++#ownContent .runner-kind { margin: 0; }
++#ownContent .runner-kind legend { margin-bottom: 6px; font-size: 11px; }
++#ownContent .runner { padding: 10px 12px; gap: 7px; background: var(--tile); }
++#ownContent .runner-path { min-height: 0; padding: 7px 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
++#ownContent .runner-actions { gap: 8px; }
++#ownContent .runner-actions button { padding: 7px 10px; font-size: 11px; }
++#ownContent .runner-segmented { grid-template-columns: repeat(3, minmax(0, 1fr)); }
++#ownContent .runner-segmented button { padding: 9px 6px; font-size: 12px; }
++#ownIntro[hidden], #ownContent[hidden], #trialPanel[hidden], #trialAccount[hidden] { display: none !important; }
++:root[data-settings-mode='true'] .panel[data-panel='env']:not([hidden]) { display: block; width: min(760px, 100%); min-height: 0; padding: 24px; }
++.trial-invite { padding: 0; margin: 0; border: 0; background: none; }
++.trial-invite p { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 8px 0 0; }
++.trial-account { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; font-size: 12px; }
++.trial-account-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
++#trialForm { margin-top: 20px; }
++#trialForm label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 8px; }
++.trial-input-row { display: flex; align-items: stretch; gap: 10px; }
++.trial-input-row button { flex-shrink: 0; }
++#trialKey { flex: 1; min-width: 0; padding: 11px 12px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--tile); color: var(--ink); font: 12px ui-monospace, monospace; }
++#trialKey:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
++#trialProgress:not(:empty) { color: var(--accent); font-weight: 600; }
++#trialDownload { margin-top: 12px; }
++#trialDownloadBar { display: block; width: 100%; height: 8px; border: 0; border-radius: 4px; overflow: hidden; accent-color: var(--accent); }
++#trialDownloadBar::-webkit-progress-bar { background: var(--line); border-radius: 4px; }
++#trialDownloadBar::-webkit-progress-value { background: var(--accent); border-radius: 4px; }
++#trialDownloadDetails { margin-top: 8px; font-variant-numeric: tabular-nums; }
++#trialNetworkHint { padding: 12px 14px; border: 1px solid var(--line-strong); border-radius: 9px; color: var(--ink); background: var(--tile); }
++.trial-details { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--line); font-size: 11px; color: var(--muted); }
++.trial-details summary { cursor: pointer; }
++.trial-details p { font-size: 11px; }
++#wizard[aria-busy='true'] .entry-modes, #wizard[aria-busy='true'] .wizard-foot { pointer-events: none; opacity: .5; }
++#wizard.trial-entry-active .stepper, #wizard.trial-entry-active #wizardNext,
++#wizard.trial-entry-active #wizardBack, #wizard.trial-entry-active #wizardFinish { display: none; }
++#wizard.trial-entry-active[data-return-available='false'] .wizard-foot { display: none; }
+ @media (max-height: 700px) {
+   .wizard { padding: 18px; }
+   .wizard-shell { max-height: calc(100vh - 36px); }
+   .wizard-head { padding: 14px 20px; }
+   .wizard-body { padding: 16px 20px; }
++  .entry-modes { margin-bottom: 14px; }
++  .entry-mode { padding: 10px 13px; }
+   :root[data-settings-mode='true'] .wizard-body { padding: 14px; align-items: flex-start; }
+   :root[data-settings-mode='true'] .panel[data-panel='env']:not([hidden]) { padding: 16px 20px; }
+ }
+ @media (max-width: 540px) {
++  .entry-modes { gap: 8px; }
++  .entry-mode { padding: 10px; }
++  .entry-mode strong { font-size: 12px; }
++  .entry-mode span { font-size: 10px; }
+ }
+ img.desktop-product-dark { display: none; }
+ html[data-theme='dark'] img.desktop-product-dark { display: block; }
+--- a/desktop-tauri/tests/shell.spec.ts
++++ b/desktop-tauri/tests/shell.spec.ts
+@@ -97,6 +97,7 @@
+       onStatus: (callback: (value: unknown) => void) => { callbacks.status = callback; },
+       onUpdateStatus: () => undefined,
+       onShowSetup: () => undefined,
++      onTrialProgress: () => undefined,
+       onNewChat: () => undefined,
+       onOpenDelivery: () => undefined,
+     };
+--- a/desktop-tauri/scripts/build-windows-backend.py
++++ b/desktop-tauri/scripts/build-windows-backend.py
+@@ -151,6 +151,8 @@
+     (ROOT / "build").mkdir(exist_ok=True)
+     work = Path(tempfile.mkdtemp(prefix="windows-freeze-", dir=ROOT / "build"))
+     env = isolated_environment(work)
++    env["ARGUS_FROZEN_APPLICATION"] = "frozen:extend"
++    env["PYTHONPATH"] = os.pathsep.join((str(REPO), os.environ["ARGUS_HOSTING_BUILD_ROOT"]))
+ 
+     def run(*command: str) -> None:
+         subprocess.run(command, cwd=REPO, env=env, stdin=subprocess.DEVNULL, check=True)
+--- a/tests/desktop/test_windows_backend_build.py
++++ b/tests/desktop/test_windows_backend_build.py
+@@ -17,6 +17,7 @@
+     script = ROOT / "desktop-tauri/scripts/build-windows-backend.py"
+     spec = importlib.util.spec_from_file_location("windows_backend_build_fixture", script)
+     module = importlib.util.module_from_spec(spec)
++    monkeypatch.setenv("ARGUS_HOSTING_BUILD_ROOT", str(tmp_path / "hosting-build"))
+     spec.loader.exec_module(module)
+     desktop = tmp_path / "desktop-tauri"
+     desktop.mkdir()
+@@ -61,7 +62,8 @@
+     def run(command, **kwargs):
+         commands.append(tuple(command))
+         assert kwargs["check"] is True
+-        assert kwargs["env"]["PYTHONPATH"] == str(tmp_path)
++        assert kwargs["env"]["PYTHONPATH"] == os.pathsep.join((str(tmp_path), os.environ["ARGUS_HOSTING_BUILD_ROOT"]))
++        assert kwargs["env"]["ARGUS_FROZEN_APPLICATION"] == "frozen:extend"
+         if "PyInstaller" in command:
+             _frozen(desktop, manifest)
+ 
+--- a/argus/core/config_snapshot.py
++++ b/argus/core/config_snapshot.py
+@@ -194,7 +194,10 @@
+             }
+         )
+ 
++    from argus_hosting.trial.client import trial_enabled
++
+     return {
++        "trial_mode": trial_enabled(env),
+         "schema_version": 1,
+         "generated_at_utc": generated_at_utc or _now_utc(),
+         "persisted_knob_error": persisted_error,
