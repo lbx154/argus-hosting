@@ -1,0 +1,639 @@
+--- a/frontend/web/src/components/ComposerRuntime.tsx
++++ b/frontend/web/src/components/ComposerRuntime.tsx
+@@ -4,6 +4,7 @@
+ import { useI18n } from '../i18n';
+ import { backendLabel } from '../lib/backend';
+ import { agentRoleName, isAgentRole } from '../lib/agentRoles';
++import { canOpenDesktopSettings, openDesktopTrialSettings } from '../lib/desktopBridge';
+ import { ModelPicker } from './ModelPicker';
+
+ type LastCall = NonNullable<Snapshot['last_call']>;
+@@ -33,11 +34,12 @@
+   const zh = locale === 'zh-CN';
+   const role = (running ? roles.find((item) => item.active) : undefined)
+     ?? roles.find((item) => item.role === 'manager');
++  const trial = data?.trial_mode === true;
+   const recent = !!lastCall && (running || Date.now() / 1000 - (lastCall.ts || 0) < LAST_CALL_CURRENT_S);
+-  const actual = recent && lastCall?.backend ? lastCall : null;
++  const actual = !trial && recent && lastCall?.backend ? lastCall : null;
+   const backend = actual ? actual.backend : role?.backend;
+-  const model = actual ? (actual.model || 'auto') : role?.model;
+-  const effort = actual ? actual.effort : role?.effort;
++  const model = trial ? 'GPT-5.5' : actual ? (actual.model || 'auto') : role?.model;
++  const effort = trial ? 'high' : actual ? actual.effort : role?.effort;
+   // The configured role that made the last call, read from settings so an
+   // Apply shows up here immediately rather than after the next call.
+   // The backend names the role whose settings govern the call; without it
+@@ -51,19 +53,22 @@
+     ? [backendLabel(nextBackend || configured!.backend, t), nextModel || configured!.model || 'auto'].join(' · ')
+     : '';
+   const label = <>
+-    {backend ? backendLabel(backend, t) : (zh ? '模型信息待确认' : 'Model information unavailable')}
++    {trial ? (zh ? '试用' : 'Trial') : backend ? backendLabel(backend, t) : (zh ? '模型信息待确认' : 'Model information unavailable')}
+     {model ? ` · ${model}` : ''}{effort ? ` · ${effort}` : ''}
+-    {!actual && running && role?.active ? ` · ${isAgentRole(role.role) ? agentRoleName(role.role, t) : role.role}` : ''}
++    {!trial && !actual && running && role?.active ? ` · ${isAgentRole(role.role) ? agentRoleName(role.role, t) : role.role}` : ''}
+   </>;
+   const title = actual
+     ? (zh ? '最近一次模型调用实际使用的后端、模型和推理强度；点击选择模型' : 'Backend, model and effort the latest model call actually used; click to choose a model')
+     : (zh ? '当前配置的后端与模型；点击选择模型' : 'Configured backend and model; click to choose a model');
+   return <div className="composer-runtime" aria-label={zh ? '当前后端与模型' : 'Current backend and model'}>
+-    {onOpenSettings
++    {onOpenSettings && !trial
+       ? <button type="button" className="composer-runtime-model" onClick={() => setPickerOpen(true)} title={title} data-runtime-open-models>{zh ? '模型：' : 'Model: '}{model || (zh ? '自动选择' : 'Automatic')}</button>
+-      : <span className="composer-runtime-model" title={title}>{zh ? '模型：' : 'Model: '}{model || (zh ? '自动选择' : 'Automatic')}</span>}
++      : <span className="composer-runtime-model" title={trial ? undefined : title}>{zh ? '模型：' : 'Model: '}{model || (zh ? '自动选择' : 'Automatic')}</span>}
+     <details className="composer-runtime-details"><summary>{zh ? '运行信息' : 'Runtime details'}</summary><div>{label}</div></details>
+     {next ? <span className="composer-runtime-next" data-runtime-next>{zh ? `下次使用：${next}` : `next call: ${next}`}</span> : null}
+-    {onOpenSettings && <ModelPicker sid={sid} open={pickerOpen} onClose={() => setPickerOpen(false)} onOpenSettings={onOpenSettings} />}
++    {trial && canOpenDesktopSettings() ? <button type="button" onClick={openDesktopTrialSettings}>
++      {zh ? '更换 Key' : 'Change Key'}
++    </button> : null}
++    {onOpenSettings && !trial && <ModelPicker sid={sid} open={pickerOpen} onClose={() => setPickerOpen(false)} onOpenSettings={onOpenSettings} />}
+   </div>;
+ }
+--- a/frontend/web/src/components/InfoModals.tsx
++++ b/frontend/web/src/components/InfoModals.tsx
+@@ -9,6 +9,7 @@
+ import { ago } from '../lib/format';
+ import { useEffect, useState, type FormEvent } from 'react';
+ import { api } from '../api';
++import { canOpenDesktopSettings, openDesktopTrialSettings } from '../lib/desktopBridge';
+ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+ import { faCheck, faChevronDown, faFloppyDisk } from '@fortawesome/free-solid-svg-icons';
+ import {
+@@ -280,7 +281,7 @@
+         {!isLoading && !isError && !hasData && <EmptyHint>{t('settings.empty')}</EmptyHint>}
+         {!isLoading && !isError && hasData && data && (
+           <div className="settings-sections">
+-            <section className="settings-section">
++            {!data.trial_mode && <section className="settings-section">
+               <h3 className="mb-3 text-sm font-semibold text-ink">{t('settings.quickConfig')}</h3>
+               <details className="mb-4">
+                 <summary className="cursor-pointer text-xs text-ink-faint">{locale === 'zh-CN' ? '服务连接设置 · 由维护者配置' : 'Service connection · Maintainer settings'}</summary>
+@@ -402,7 +403,18 @@
+                   {quickConfigMsg}
+                 </div>
+               )}
+-            </section>
++            </section>}
++
++            {data.trial_mode && <section className="settings-section" aria-label={t('settings.trialAccount')}>
++              <div className="flex flex-wrap items-center justify-between gap-3">
++                <div>
++                  <h3 className="text-sm font-semibold text-ink">{t('settings.trialAccount')}</h3>
++                  <p className="mt-1 text-xs text-ink-dim">GPT-5.5 · high</p>
++                  <p className="mt-1 text-xs text-ink-faint">{t('settings.trialKeyHint')}</p>
++                </div>
++                {canOpenDesktopSettings() && <button type="button" className="compact-control px-3 py-2" onClick={() => { onClose(); openDesktopTrialSettings(); }}>{t('settings.changeTrialKey')}</button>}
++              </div>
++            </section>}
+
+             {advancedOpen && <AdvisorSettings sid={sid} primaryModel={data.roles.find(role => role.role === 'engineer')?.model} />}
+
+@@ -515,7 +527,7 @@
+         )}
+       </div>
+     </Modal>
+-    <ModelPicker sid={sid} open={open && pickerOpen} onClose={() => setPickerOpen(false)} />
++    {!data?.trial_mode && <ModelPicker sid={sid} open={open && pickerOpen} onClose={() => setPickerOpen(false)} />}
+     </>
+   );
+ }
+--- a/frontend/web/src/components/ModelPicker.tsx
++++ b/frontend/web/src/components/ModelPicker.tsx
+@@ -219,6 +219,7 @@
+     }, new Map<string, string[]>())]
+       .map(([model, names]) => `${names.join(locale === 'zh-CN' ? '、' : ', ')}${locale === 'zh-CN' ? '：' : ': '}${model}`)
+       .join(' · ') + (effort ? ` · ${effortName(effort)}` : '');
++  const trial = config.data?.trial_mode === true;
+   const loading = config.isLoading || choicesQuery.isLoading;
+   const failed = config.isError || choicesQuery.isError;
+
+@@ -228,7 +229,8 @@
+       <div className="model-picker">
+         {loading && <div className="flex justify-center py-10"><Spinner /></div>}
+         {!loading && failed && <p role="alert" className="px-1 py-8 text-center text-sm text-err">{t('models.loadError')}</p>}
+-        {!loading && !failed && choices && <>
++        {!loading && !failed && trial && <EmptyHint>{t('models.trial')}</EmptyHint>}
++        {!loading && !failed && !trial && choices && <>
+           <div className="model-picker-controls">
+             <div className="route-seg" role="radiogroup" aria-label={t('models.modeLabel')}>
+               <button type="button" role="radio" aria-checked={mode === 'all'} onClick={() => { setMode('all'); setMessage(null); }}>{t('models.modeAll')}</button>
+@@ -307,7 +309,7 @@
+   const { t } = useI18n();
+   const { data } = useConfig(sid, true);
+   const [open, setOpen] = useState(false);
+-  if (!data) return null;
++  if (!data || data.trial_mode) return null;
+   const models = [...new Set(data.roles
+     .filter(row => (CHOOSER_ROLES as string[]).includes(row.role))
+     .map(row => (unset(row.model) ? t('models.none') : row.model)))];
+--- a/frontend/web/src/components/Sidebar.tsx
++++ b/frontend/web/src/components/Sidebar.tsx
+@@ -12,7 +12,7 @@
+ import { filterProjects, hasHumanProjectLabel } from '../../../core/src/projects';
+ import type { ThemeMode } from './TopBar';
+ import { useI18n } from '../i18n';
+-import { Archive, ChevronDown, ChevronRight, Folder, MoreHorizontal, PackageCheck, PanelLeftClose, PanelLeftOpen, Pin, Play, Flag, Search, Settings, Monitor } from 'lucide-react';
++import { Archive, ChevronDown, ChevronRight, Cpu, Folder, MoreHorizontal, PackageCheck, PanelLeftClose, PanelLeftOpen, Pin, Play, Flag, Search, Settings, Monitor } from 'lucide-react';
+ import { readLocalStorage, writeLocalStorage } from '../lib/storage';
+
+ const ADVANCED_KEY = 'argus.sidebar.advanced.v1';
+@@ -480,6 +480,12 @@
+               </summary>
+               <div className="sidebar-more-menu">
+                 {onDevices && <button type="button" onClick={onDevices} className="icon-control flex h-8 w-full items-center gap-2 px-2 text-xs" aria-label={zh ? '设备与登录' : 'Devices and sign-in'}><Monitor size={15} />{zh ? '设备与登录' : 'Devices and sign-in'}</button>}
++                {import.meta.env.VITE_ARGUS_HOSTED_TRIAL === '1' ? (
++                  <a href="/invite/compute" aria-label={t('sidebar.compute')} title={t('sidebar.compute')}
++                    className="icon-control flex h-8 w-8 items-center justify-center">
++                    <Cpu size={16} />
++                  </a>
++                ) : null}
+                 <AppearanceControls themeMode={themeMode} onCycleTheme={onCycleTheme} labelled />
+               </div>
+             </details>
+--- a/frontend/web/src/lib/desktopBridge.ts
++++ b/frontend/web/src/lib/desktopBridge.ts
+@@ -92,6 +92,10 @@
+
+ export function canOpenDesktopSettings(): boolean {
+   return embeddedDesktopParent() !== null;
++}
++
++export function openDesktopTrialSettings(): void {
++  embeddedDesktopParent()?.postMessage({ type: 'argus:show-trial-setup' }, '*');
+ }
+
+ function notificationPayload(value: unknown): DesktopDeliveryNotification | null {
+--- a/frontend/web/src/lib/verticalStore.ts
++++ b/frontend/web/src/lib/verticalStore.ts
+@@ -11,6 +11,9 @@
+ export const KIND_FILTERS: readonly KindFilter[] = ['all', 'installed', 'available', 'builtin'];
+
+ export const VERTICAL_ACTIONS: readonly VerticalAction[] = ['install', 'update', 'enable', 'disable', 'uninstall'];
++
++/** Actions that change what is on disk; a hosted workspace never offers them. */
++const HOST_OWNED_ACTIONS: ReadonlySet<VerticalAction> = new Set(['install', 'update', 'uninstall']);
+
+ export interface StoreFilter {
+   query: string;
+@@ -41,6 +44,11 @@
+ export function verticalTitle(row: Pick<VerticalRow, 'name' | 'kind'>, locale: string): string {
+   if (locale !== 'zh-CN') return row.name.replaceAll('_', ' ');
+   return (row.kind === 'builtin' ? BUNDLED_GUIDES[row.name]?.title : undefined) ?? VERTICAL_TITLES[row.name] ?? row.name.replaceAll('_', ' ');
++}
++
++/** The hosted trial build sets this flag; the host also reports it per payload. */
++export function hostedTrialBuild(env: Record<string, string | boolean | undefined> = import.meta.env): boolean {
++  return env.VITE_ARGUS_HOSTED_TRIAL === '1';
+ }
+
+ /** "Installed" means present on disk and usable, so bundled verticals count; "Built-in" stays its own group. */
+@@ -88,9 +96,10 @@
+   return [...tags].sort((a, b) => a.localeCompare(b));
+ }
+
+-/** The buttons a card shows: exactly the server's allowed actions. */
+-export function visibleActions(row: VerticalRow): VerticalAction[] {
+-  return row.actions.filter((action) => VERTICAL_ACTIONS.includes(action));
++/** The buttons a card shows: exactly the server's list, minus what a host keeps for itself. */
++export function visibleActions(row: VerticalRow, hosted: boolean): VerticalAction[] {
++  const owned = hosted || row.managed_by_host;
++  return row.actions.filter((action) => VERTICAL_ACTIONS.includes(action) && !(owned && HOST_OWNED_ACTIONS.has(action)));
+ }
+
+ export const actionLabelKey = (action: VerticalAction | string) => `verticals.action.${action}`;
+--- a/frontend/web/src/components/VerticalStore.tsx
++++ b/frontend/web/src/components/VerticalStore.tsx
+@@ -8,7 +8,7 @@
+ import { useI18n } from '../i18n';
+ import {
+   EMPTY_FILTER, KIND_FILTERS, VERTICAL_ACTIONS, actionLabelKey, anyRunning, deriveRoutingPaths, deriveTags, failureDetail, filterLabelKey,
+-  filterRows, formatSize, hasStoreCapability, isRunning, isStoreConflict, isStoreMissing, kindLabelKey,
++  filterRows, formatSize, hasStoreCapability, hostedTrialBuild, isRunning, isStoreConflict, isStoreMissing, kindLabelKey,
+   knownNames, operationLabelKey, pollInterval, progressPercent, purposeText, visibleActions, type StoreFilter,
+   BUNDLED_GUIDES, verticalTitle,
+ } from '../lib/verticalStore';
+@@ -51,9 +51,10 @@
+   </button>;
+ }
+
+-// One vertical. The buttons come from the server's actions.
+-export function VerticalCard({ row, locale, busy, failure, known, onAct, onJump, onTag }: {
+-  row: VerticalRow; locale: string; busy: boolean; failure?: CardFailure; known: ReadonlySet<string>;
++// One vertical. The buttons come from row.actions and nowhere else; a hosted
++// workspace additionally loses install, update and uninstall.
++export function VerticalCard({ row, locale, hosted, busy, failure, known, onAct, onJump, onTag }: {
++  row: VerticalRow; locale: string; hosted: boolean; busy: boolean; failure?: CardFailure; known: ReadonlySet<string>;
+   onAct: Act; onJump?: (name: string) => void; onTag?: (tag: string) => void;
+ }) {
+   const { t } = useI18n();
+@@ -64,7 +65,7 @@
+   const needsEnvironment = row.missing_python.length > 0 || !!row.runtime_issues?.length;
+   const running = isRunning(row);
+   const disabled = busy || running;
+-  const actions = visibleActions(row);
++  const actions = visibleActions(row, hosted);
+   const operation = row.operation;
+   const percent = progressPercent(operation);
+   const operationName = (action: string) => VERTICAL_ACTIONS.includes(action as VerticalAction) ? t(actionLabelKey(action)) : action;
+@@ -195,8 +196,8 @@
+
+ // The page inside the modal: catalog line, filters and the card grid. Pure
+ // with respect to data so the tests can render it without a network.
+-export function VerticalStoreView({ payload, filter, onFilter, supported, loading, refreshing, error, pending, failures, onAct, onRefresh, onJump }: {
+-  payload: VerticalsPayload | null; filter: StoreFilter; onFilter: (next: StoreFilter) => void;
++export function VerticalStoreView({ payload, filter, onFilter, hosted, supported, loading, refreshing, error, pending, failures, onAct, onRefresh, onJump }: {
++  payload: VerticalsPayload | null; filter: StoreFilter; onFilter: (next: StoreFilter) => void; hosted: boolean;
+   supported: boolean | null; loading: boolean; refreshing: boolean; error: string; pending: string | null;
+   failures: Record<string, CardFailure>; onAct: Act; onRefresh: () => void; onJump: (name: string) => void;
+ }) {
+@@ -209,7 +210,7 @@
+   const filtered = filter.query.trim() !== '' || filter.kind !== 'all' || filter.tag !== null || Boolean(filter.routingPath);
+   const catalog = payload?.catalog;
+   return <>
+-    <p className="mt-2 text-sm text-ink-faint">{t('verticals.intro')}</p>
++    <p className="mt-2 text-sm text-ink-faint">{hosted ? t('verticals.hostedNote') : t('verticals.intro')}</p>
+     {supported === false && <p role="alert" className="mt-4 rounded-lg border border-line bg-bg/70 p-3 text-sm text-ink-dim" data-testid="vertical-store-too-old">{t('verticals.tooOld')}</p>}
+     {supported !== false && <>
+       {catalog && <details className="mt-3 rounded-lg border border-line/50 p-3"><summary className="cursor-pointer text-xs text-ink-faint">{locale === 'zh-CN' ? '目录来源与更新' : 'Catalog source and updates'}</summary><div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-ink-faint" data-testid="vertical-catalog">
+@@ -252,7 +253,7 @@
+       {payload && rows.length === 0 && <p className="mt-4 text-sm text-ink-faint">{t('verticals.none')}</p>}
+       {rows.length > 0 && shown.length === 0 && <p className="mt-4 text-sm text-ink-faint">{t('verticals.noMatches')}</p>}
+       {shown.length > 0 && <div className="mt-3 grid gap-3 md:grid-cols-2" data-testid="vertical-grid">
+-        {shown.map((row) => <VerticalCard key={row.name} row={row} locale={locale} busy={pending === row.name} failure={failures[row.name]}
++        {shown.map((row) => <VerticalCard key={row.name} row={row} locale={locale} hosted={hosted} busy={pending === row.name} failure={failures[row.name]}
+           known={known} onAct={onAct} onJump={onJump} onTag={(tag) => onFilter({ ...filter, tag })} />)}
+       </div>}
+     </>}
+@@ -276,6 +277,7 @@
+   const tRef = useRef(t);
+   tRef.current = t;
+   const running = anyRunning(payload?.verticals ?? []);
++  const hosted = Boolean(payload?.host.managed_by_host) || hostedTrialBuild();
+
+   // An older backend has no store: say so instead of showing a failed request.
+   useEffect(() => {
+@@ -376,7 +378,7 @@
+         <h2 id="vertical-store-title" className="flex items-center gap-2 text-lg font-semibold"><Store size={20} strokeWidth={1.5} className="text-blue" />{t('verticals.title')}</h2>
+         <button ref={close} type="button" aria-label={t('verticals.close')} className="icon-control p-1.5" onClick={onClose}><X size={18} /></button>
+       </div>
+-      <VerticalStoreView payload={payload} filter={filter} onFilter={setFilter} supported={supported} loading={loading} refreshing={refreshing}
++      <VerticalStoreView payload={payload} filter={filter} onFilter={setFilter} hosted={hosted} supported={supported} loading={loading} refreshing={refreshing}
+         error={error?.text ?? ''} pending={pending} failures={failures} onAct={act} onRefresh={() => void refreshCatalog()} onJump={jump} />
+     </section>
+   </div>, document.body);
+--- a/frontend/web/src/components/PluginLauncher.tsx
++++ b/frontend/web/src/components/PluginLauncher.tsx
+@@ -22,7 +22,7 @@
+
+ // The sidebar and landing entries. An installed workbench opens with one click;
+ // a workbench the service is still preparing shows a single sentence and the
+-// current step; the plugin center offers installation and environment settings.
++// current step; the plugin center itself stays the manual path for self-hosted copies.
+ export function PluginEntries({ plugins, compact = false, pending, onLaunch, onManage }: {
+   plugins: Plugin[]; compact?: boolean; pending: string | null;
+   onLaunch: (plugin: Plugin) => void; onManage: () => void;
+@@ -64,9 +64,11 @@
+   </>;
+ }
+
+-// One plugin inside the plugin center, with its installation and environment tools.
++// One plugin inside the plugin center. A plugin the service provides keeps its
++// environment tools but offers no install, update, disable or uninstall control.
+ export function PluginCard({ plugin, running, locale, act, children }: { plugin: Plugin; running: boolean; locale: string; act: Act; children?: ReactNode }) {
+   const tr = usePluginText();
++  const managed = Boolean(plugin.managed_by_host);
+   const state = pluginEntryState(plugin);
+   const disabled = running || !plugin.supported;
+   const zh = locale === 'zh-CN';
+@@ -81,25 +83,26 @@
+     </dl>}
+     <p className="mt-3 text-xs leading-5 text-ink-dim">{!plugin.supported ? tr(plugin.reason)
+       : state === 'ready' ? zh ? '工作台已就绪。' : 'The workbench is ready.'
+-        : zh ? '需要先准备运行环境。请由维护此服务的人完成部署与软件授权。' : 'The execution environment needs preparation. Ask the service maintainer to configure deployment and software licenses.'}</p>
++        : managed ? tr(state === 'preparing' ? preparingSentence(plugin.name) : unavailableSentence(plugin.name))
++          : zh ? '需要先准备运行环境。请由维护此服务的人完成部署与软件授权。' : 'The execution environment needs preparation. Ask the service maintainer to configure deployment and software licenses.'}</p>
+     {plugin.installed && plugin.enabled && <button className={`${control} mt-3`} disabled={disabled} onClick={() => void act('launch')}>{tr("打开工作台")}<ArrowUpRight size={14}/></button>}
+     <details className="mt-4 rounded-lg border border-line/50 p-3">
+       <summary className="cursor-pointer text-xs text-ink-faint">{zh ? '部署与环境设置' : 'Deployment and environment settings'}</summary>
+     <div className="mt-4 text-xs text-ink-faint">{tr(plugin.installed ? plugin.enabled ? tr("已启用") : tr("已停用") : tr("未安装"))}{tr(" · 当前后端 ")}{tr(Array.from(new Set(Object.values(plugin.backends))).join(' / '))}</div>
+     {tr(!plugin.supported && <p className="mt-3 text-sm text-ink-dim">{tr(plugin.reason)}</p>)}
+-    {tr(state === 'preparing' && <p className="mt-3 text-sm text-ink-dim">{tr(preparingSentence(plugin.name))}</p>)}
++    {tr(managed && state === 'preparing' && <p className="mt-3 text-sm text-ink-dim">{tr(preparingSentence(plugin.name))}</p>)}
+     {tr(plugin.operation?.status === 'running' && <p role="status" className="mt-3 flex items-center gap-2 text-sm text-ink-dim"><Loader2 size={14} className="animate-spin"/>{tr(plugin.operation.progress)}</p>)}
+     {tr(plugin.operation?.status === 'failed' && <p role="status" className="mt-3 break-words text-sm text-ink-dim">{tr(plugin.operation.error)}</p>)}
+     <div className="mt-4 flex flex-wrap items-center gap-2">
+-      {tr(!plugin.installed && <button className={control} disabled={disabled} onClick={() => void act('install')}><Download size={14}/>{tr("安装")}</button>)}
+-      {tr(plugin.installed && !plugin.enabled && <button className={control} disabled={disabled} onClick={() => void act('enable')}>{tr("启用")}</button>)}
+-      {tr(plugin.update_available && <button className={control} disabled={disabled} onClick={() => void act('update')}><RefreshCw size={14}/>{plugin.environment_update ? tr("更新科学环境校验") : <>{tr("更新至 ")}{tr(plugin.version)}</>}</button>)}
+-      {tr(plugin.installed && plugin.enabled && <button className={control} disabled={running} onClick={() => void act('disable')}>{tr("停用")}</button>)}
+-      {tr(plugin.installed && <button className={control} disabled={running} onClick={() => void act('uninstall')}>{tr("卸载")}</button>)}
++      {tr(!plugin.installed && !managed && <button className={control} disabled={disabled} onClick={() => void act('install')}><Download size={14}/>{tr("安装")}</button>)}
++      {tr(plugin.installed && !plugin.enabled && !managed && <button className={control} disabled={disabled} onClick={() => void act('enable')}>{tr("启用")}</button>)}
++      {tr(plugin.update_available && !managed && <button className={control} disabled={disabled} onClick={() => void act('update')}><RefreshCw size={14}/>{plugin.environment_update ? tr("更新科学环境校验") : <>{tr("更新至 ")}{tr(plugin.version)}</>}</button>)}
++      {tr(plugin.installed && plugin.enabled && !managed && <button className={control} disabled={running} onClick={() => void act('disable')}>{tr("停用")}</button>)}
++      {tr(plugin.installed && !managed && <button className={control} disabled={running} onClick={() => void act('uninstall')}>{tr("卸载")}</button>)}
+     </div>
+     {children}
+-    {tr(plugin.installed && <p className="mt-4 text-xs leading-relaxed text-ink-faint">{tr(`原生会话输入 ${plugin.command || ''} 可启用后台工具。卸载保留会话、研究数据和科学软件。`)}</p>)}
+-    {tr(!plugin.installed && <p className="mt-4 text-xs leading-relaxed text-ink-faint">{tr("首次安装自动配置独立 Python、DIALS、Systre / Java 和 PLATON 学术免费组件。SHELX 稍后输入授权信息即可安装。")}</p>)}
++    {tr(plugin.installed && <p className="mt-4 text-xs leading-relaxed text-ink-faint">{tr(managed ? tr(`原生会话输入 ${plugin.command || ''} 可启用后台工具。`) : tr(`原生会话输入 ${plugin.command || ''} 可启用后台工具。卸载保留会话、研究数据和科学软件。`))}</p>)}
++    {tr(!plugin.installed && !managed && <p className="mt-4 text-xs leading-relaxed text-ink-faint">{tr("首次安装自动配置独立 Python、DIALS、Systre / Java 和 PLATON 学术免费组件。SHELX 稍后输入授权信息即可安装。")}</p>)}
+     {tr(plugin.installed && plugin.setup && <PluginEnvironment health={plugin.health} setup={plugin.setup} running={running} platform={plugin.platform} machine={plugin.machine} act={act}/>)}
+     </details>
+     {tr(plugin.rights_notice && <p className="mt-3 text-[10px] leading-relaxed text-ink-faint" data-testid="plugin-rights-notice">{tr(locale === 'zh-CN' ? plugin.rights_notice_zh || plugin.rights_notice : plugin.rights_notice)}</p>)}
+@@ -118,6 +121,7 @@
+   const [licenseAccepted, setLicenseAccepted] = useState(false);
+   const close = useRef<HTMLButtonElement>(null);
+   const preparing = plugins.some(plugin => pluginEntryState(plugin) === 'preparing');
++  const provided = plugins.length > 0 && plugins.every(plugin => plugin.managed_by_host);
+   async function refresh(signal?: AbortSignal) {
+     const response = await fetch('/api/plugins', { headers: authHeaders(), signal });
+     if (!response.ok) throw new Error(tr("无法读取插件列表"));
+@@ -131,7 +135,7 @@
+     }
+   }, [open]);
+   useEffect(() => {
+-    // Discover installed entries on arrival even while the center is closed.
++    // Discover installed/hosted entries on arrival even while the center is closed.
+     const controller = new AbortController();
+     const load = () => refresh(controller.signal).catch(e => { if (!controller.signal.aborted && open) setError(e.message); });
+     if (open) { close.current?.focus(); setError(''); setLoading(true); }
+@@ -170,7 +174,7 @@
+         className="max-h-[85vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-line bg-panel p-6 text-ink shadow-xl">
+         <div className="flex items-center justify-between"><h2 id="plugin-title" className="text-lg font-semibold">{tr("插件")}</h2>
+           <button ref={close} type="button" aria-label={tr("关闭插件列表")} className="icon-control p-1.5" onClick={() => setOpen(false)}><X size={18}/></button></div>
+-        <p className="mb-6 mt-2 text-sm text-ink-faint">{tr("按需安装研究工具，沿用 Argus 的模型与执行后端。")}</p>
++        <p className="mb-6 mt-2 text-sm text-ink-faint">{tr(provided ? tr("研究工具由服务方提供，沿用 Argus 的模型与执行后端。") : tr("按需安装研究工具，沿用 Argus 的模型与执行后端。"))}</p>
+         {tr(error && <p role="alert" className="mb-4 text-sm text-ink-dim">{tr(error)}</p>)}
+         {tr(loading && <p className="text-sm text-ink-faint">{tr("正在读取插件…")}</p>)}
+         {tr(!loading && !error && !plugins.length && <p className="text-sm text-ink-faint">{tr("暂无可用插件")}</p>)}
+--- a/frontend/web/src/lib/pluginLaunch.ts
++++ b/frontend/web/src/lib/pluginLaunch.ts
+@@ -1,9 +1,9 @@
+ // How a plugin shows up outside the plugin center: as a workbench entry that
+ // opens directly, as a quiet preparing line while the service installs it,
+-// or through the plugin center where Install lives.
++// or, for self-hosted copies, through the plugin center where Install lives.
+ export type PluginEntry = {
+   id: string; name: string; installed: boolean; enabled: boolean; supported: boolean;
+-  reason?: string;
++  managed_by_host?: boolean; reason?: string;
+   operation?: { status?: string; progress?: string; error?: string };
+ };
+
+@@ -11,9 +11,9 @@
+
+ export function pluginEntryState(plugin: PluginEntry): PluginEntryState {
+   if (plugin.installed && plugin.enabled && plugin.supported) return 'ready';
+-  if (plugin.operation?.status === 'failed') return 'unavailable';
+-  if (plugin.operation?.status === 'running') return 'preparing';
+-  return 'manual';
++  if (!plugin.managed_by_host) return 'manual';
++  if (!plugin.supported || plugin.operation?.status === 'failed') return 'unavailable';
++  return 'preparing';
+ }
+
+ export const preparingSentence = (name: string) => `正在准备 ${name} 工作台，首次需要几分钟`;
+--- a/frontend/web/src/lib/requestFailure.ts
++++ b/frontend/web/src/lib/requestFailure.ts
+@@ -1,3 +1,5 @@
++import { ApiError } from '../../../core/src/http';
++
+ type Translate = (key: string) => string;
+
+ export interface RequestFailure {
+@@ -5,11 +7,23 @@
+   text: string;
+   /** The request line and status, kept for a fold or a tooltip. */
+   technical: string;
++  /** True when this Argus refuses the route on purpose, so the feature is simply absent here. */
++  refused: boolean;
++}
++
++// The hosted trial answers routes it does not offer with 403 and the code
++// "trial_route_unavailable"; an older portal answers 403 or 404 without a
++// code. Either way the feature is absent, which is a fact, not a failure.
++export function routeRefused(error: unknown): boolean {
++  if (!(error instanceof ApiError)) return false;
++  return error.code === 'trial_route_unavailable' || error.status === 403 || error.status === 404;
+ }
+
+ export function requestFailureText(error: unknown, t: Translate): RequestFailure {
++  const refused = routeRefused(error);
+   return {
+-    text: t('operations.requestFailed'),
++    text: t(refused ? 'operations.unavailableHere' : 'operations.requestFailed'),
+     technical: error instanceof Error ? error.message : String(error || ''),
++    refused,
+   };
+ }
+--- a/frontend/web/src/lib/format.ts
++++ b/frontend/web/src/lib/format.ts
+@@ -110,7 +110,9 @@
+  * HTTP failures read as what happened, not as a request line and status code. */
+ export function errorText(error: unknown): string {
+   if (error instanceof ApiError) return apiErrorText(error);
+-  return error instanceof Error ? error.message : String(error || 'Unknown error');
++  const message = error instanceof Error ? error.message : String(error || 'Unknown error');
++  const full = /workspace storage is full \(([\d.]+) GB of ([\d.]+) GB\)/.exec(message);
++  return full ? translate('storagePause.notice', { used: full[1], limit: full[2] }) : message;
+ }
+
+ function apiErrorText(error: ApiError): string {
+--- a/frontend/web/src/research-workbench/pages/RuntimeControlPage.tsx
++++ b/frontend/web/src/research-workbench/pages/RuntimeControlPage.tsx
+@@ -6,11 +6,12 @@
+ import { RawDisclosure } from '../../components/primitives';
+ import { useI18n } from '../../i18n';
+ import { isImeComposing } from '../../lib/ime';
+-import { requestFailureText } from '../../lib/requestFailure';
++import { requestFailureText, routeRefused } from '../../lib/requestFailure';
+ import { currentWorkStatus, workStatusLabel } from '../../lib/workStatus';
+ import type { ActiveWorkbenchPageProps } from './pageTypes';
+ import './runtimeControl.css';
+
++const HOSTED_TRIAL = import.meta.env.VITE_ARGUS_HOSTED_TRIAL === '1';
+
+ async function requireCommandSuccess(operation: Promise<unknown>) {
+   const result = await operation;
+@@ -52,7 +53,7 @@
+   });
+   const source = useQuery({
+     queryKey: ['runtime-source-update'], queryFn: ({ signal }) => api.sourceUpdateStatus(signal),
+-    enabled: active && settingsOpen && !readOnly, retry: false,
++    enabled: active && settingsOpen && !HOSTED_TRIAL && !readOnly, retry: false,
+     refetchInterval: query => query.state.data?.running ? 1_500 : false,
+   });
+   useEffect(() => {
+@@ -84,7 +85,7 @@
+     if (!disabled && window.confirm(question)) void run(key, operation, message);
+   };
+   const requestError = (error: unknown) => error
+-    ? requestFailureText(error, t).text
++    ? routeRefused(error) ? t('operations.unavailableHere') : requestFailureText(error, t).text
+     : '';
+   const replacements = snap.daemon_admission?.running_daemons ?? [];
+
+@@ -141,7 +142,7 @@
+           <button className="button" disabled={disabled || external} onClick={() => confirmRun('restart', zh ? '等待当前工作结束后，使用当前版本重新启动。确认继续？' : 'Wait for active work, then restart on the current release?',
+             () => api.upgradeDaemon(sid, snap.daemon_commands?.revision), zh ? '安全重启请求已提交。' : 'Safe restart requested.')}><RefreshCw size={15} />{zh ? '安全重启' : 'Restart safely'}</button>
+         </div>
+-        {!readOnly && <div className="runtime-source-update">
++        {!HOSTED_TRIAL && !readOnly && <div className="runtime-source-update">
+           <h3>{t('operations.sourceUpdate')}</h3>
+           {source.error ? <p role="alert">{requestError(source.error)}</p> : source.data?.error || source.data?.message ? <p>{source.data.error || source.data.message}</p> : null}
+           {!source.error && <div className="runtime-field-row">
+--- a/frontend/web/src/components/HtmlPreview.tsx
++++ b/frontend/web/src/components/HtmlPreview.tsx
+@@ -21,8 +21,11 @@
+     {zh ? '网页预览加载失败，请重试或下载文件。' : 'Preview could not load. Retry or download the file.'}
+     <button type="button" className="ml-3 underline" onClick={() => void preview.refetch()}>{zh ? '重试' : 'Retry'}</button>
+   </div>;
++  // Hosted frontend releases can precede tenant API upgrades.
++  const servedPage = preview.data?.served_page === true;
+   return <div className={`flex min-h-0 w-full flex-1 flex-col ${className}`}>
+     {!!preview.data?.warnings.length && <p className="shrink-0 bg-warn/10 px-3 py-2 text-xs text-warn" role="status">{zh ? '部分配套资源无法加载，页面可能不完整。' : 'Some linked assets are unavailable; the preview may be incomplete.'}</p>}
+-    <iframe title={title} src={previewPageUrl(sid, path)} sandbox="allow-scripts allow-downloads" referrerPolicy="no-referrer" className="min-h-0 w-full flex-1 border-0 bg-white" />
++    {!servedPage && <p className="shrink-0 bg-warn/10 px-3 py-2 text-xs text-warn" role="status">{zh ? '页面里的交互脚本可能无法运行。' : 'Interactive scripts may not run in this preview.'}</p>}
++    <iframe title={title} src={servedPage ? previewPageUrl(sid, path) : undefined} srcDoc={servedPage ? undefined : preview.data?.html ?? html} sandbox="allow-scripts allow-downloads" referrerPolicy="no-referrer" className="min-h-0 w-full flex-1 border-0 bg-white" />
+   </div>;
+ }
+--- a/frontend/core/src/missionOutcome.ts
++++ b/frontend/core/src/missionOutcome.ts
+@@ -146,6 +146,8 @@
+   research_open: ['the work waits for the team to decide how it goes on', '工作在等团队决定下一步怎么做'],
+ };
+
++// Mirrors why_allowance_exhausted in argus/core/mission_view/_wording.py.
++const ALLOWANCE_EXHAUSTED: Pair = ['the trial allowance is used up', '试用额度已用完'];
+
+ function normalizedString(value: unknown): string {
+   return String(value ?? '').trim().toLowerCase();
+@@ -283,7 +285,11 @@
+         : {};
+       const stopKind = normalizedString(event.stop_kind) || normalizedString(outcome.interruption_kind);
+       kind = 'mission_paused';
+-      const why = pauseClause(status, event.park_reason, stopKind, zh);
++      // A spent trial allowance parks like a provider fence, but the model
++      // service is fine: say what actually ran out.
++      const why = normalizedString(event.failure_kind) === 'allowance_exhausted'
++        ? ALLOWANCE_EXHAUSTED[zh ? 1 : 0]
++        : pauseClause(status, event.park_reason, stopKind, zh);
+       label = say('mission_paused').replace('{why}', why);
+     }
+   }
+--- a/frontend/core/src/eventRender/index.ts
++++ b/frontend/core/src/eventRender/index.ts
+@@ -117,6 +117,7 @@
+   }
+   if (quiet) return null;
+   const why: Record<string, [string, string]> = {
++    trial_quota_exceeded: ['the trial quota is running low', '试用额度不够了'],
+     timeout: ['the model took too long to answer', '模型太久没有回应'],
+   };
+   const cause = (chinese: boolean) => (Object.hasOwn(why, code) ? why[code][chinese ? 1 : 0] : '')
+--- a/frontend/web/src/i18n.tsx
++++ b/frontend/web/src/i18n.tsx
+@@ -104,6 +104,14 @@
+   'connection.unreachableDetail': 'Keep Argus Desktop running, wait for the local service to become ready, then retry.',
+   'error.network': 'Could not reach the Argus service. Check the connection and retry.',
+   'error.unauthorized': 'This browser’s access has expired. Open a fresh pairing link.',
++  'sidebar.compute': 'Compute queue & allowance',
++  'settings.trialAccount': 'Trial account',
++  'settings.trialKeyHint': 'Replace your Key here when its allowance runs out. Your projects and conversations stay in place.',
++  'settings.changeTrialKey': 'Change Key',
++  'storagePause.notice': 'Workspace storage is full ({used} GB / {limit} GB). Work is paused and every file is kept; it continues once files are cleaned up or after you contact the administrator.',
++  'operations.unavailableHere': 'This is not available on this Argus.',
++  'verticals.hostedNote': 'Verticals are provided by the host; you can enable or disable them for your workspace.',
++  'models.trial': 'The trial account chooses its model for you.',
+   'error.forbidden': 'You do not have permission to do that.',
+   'error.notFound': 'That item no longer exists; it may have been deleted or moved.',
+   'error.tooLarge': 'The file is larger than the upload limit.',
+@@ -790,6 +798,14 @@
+   'connection.unreachableDetail': '请保持 Argus Desktop 运行，等待本地服务就绪后再重试。',
+   'error.network': '连不上 Argus 服务，请检查网络后重试。',
+   'error.unauthorized': '这个浏览器的访问凭证已失效，请重新打开配对链接。',
++  'sidebar.compute': '算力队列与账户额度',
++  'settings.trialAccount': '试用账号',
++  'settings.trialKeyHint': '额度用完后可在这里更换 Key，项目和对话会保留。',
++  'settings.changeTrialKey': '更换 Key',
++  'storagePause.notice': '工作区存储已满（{used} GB / {limit} GB），任务已暂停，文件都保留着；清理文件或联系管理员后会继续。',
++  'operations.unavailableHere': '这项功能在当前的 Argus 上不提供。',
++  'verticals.hostedNote': '垂域由服务方提供；你可以为自己的工作区启用或停用。',
++  'models.trial': '试用账号由服务方选择模型。',
+   'error.forbidden': '没有权限执行这个操作。',
+   'error.notFound': '要找的内容已不存在，可能被删除或移动了。',
+   'error.tooLarge': '文件超过了上传大小限制。',
+--- a/frontend/web/src/api.ts
++++ b/frontend/web/src/api.ts
+@@ -262,6 +262,7 @@
+   doc: string;
+ }
+ export interface ConfigSnapshot {
++  trial_mode?: boolean;
+   schema_version: number;
+   generated_at_utc: string;
+   roles: ConfigRole[];
+--- a/frontend/web/src/App.tsx
++++ b/frontend/web/src/App.tsx
+@@ -25,6 +25,7 @@
+ import { PendingReplyDialog } from './components/PendingReplyDialog';
+ import { GuardianBanner } from './components/GuardianBanner';
+ import { NoOperatorBanner } from './components/NoOperatorBanner';
++import { hostedTrialBuild } from './lib/verticalStore';
+ import { WorkPauseBanner } from './components/WorkPauseBanner';
+ import { hasHumanProjectLabel, rankProjects } from '../../core/src/projects';
+ import { ArtifactModal } from './components/ArtifactModal';
+@@ -1290,7 +1291,7 @@
+       ...(kiosk ? [] : [{ id: 'new', label: t('palette.newDaemon'), hint: '+', group: t('palette.view'), run: startNewSession }]),
+       { id: 'transcript', label: t('palette.openTranscript'), hint: '/transcript', group: t('palette.view'), run: () => setOverlay('transcript') },
+       { id: 'history-search', label: locale === 'zh-CN' ? '搜索历史与成果' : 'Search history and results', group: t('palette.view'), run: () => setSearchOpen(true) },
+-      { id: 'device-access', label: locale === 'zh-CN' ? '设备与登录' : 'Devices and sign-in', group: t('palette.view'), run: () => setDevicesOpen(true) },
++      ...(hostedTrialBuild() ? [] : [{ id: 'device-access', label: locale === 'zh-CN' ? '设备与登录' : 'Devices and sign-in', group: t('palette.view'), run: () => setDevicesOpen(true) }]),
+       { id: 'inspector', label: t('palette.openProject'), hint: t('palette.projectHint'), group: t('palette.view'), run: () => setOverlay('inspector') },
+       { id: 'operations', label: t('palette.openOperations'), hint: t('palette.operationsHint'), group: t('palette.view'), run: openRuntimeControls },
+       { id: 'verticals', label: t('verticals.openStore'), hint: t('verticals.paletteHint'), group: t('palette.view'), run: () => setOverlay('verticals') },
+@@ -1414,7 +1415,7 @@
+           resultsCount={loadedSid ? deliveryHistory.length : 0}
+           onNew={() => startNewSession()}
+           onSearch={() => setSearchOpen(true)}
+-          onDevices={() => setDevicesOpen(true)}
++          onDevices={hostedTrialBuild() ? undefined : () => setDevicesOpen(true)}
+           loading={projectsQ.isLoading}
+           creating={creatingDaemon}
+           error={projectsQ.isError ? errorText(projectsQ.error) : undefined}
+--- a/packages/contracts/src/models.ts
++++ b/packages/contracts/src/models.ts
+@@ -617,6 +617,7 @@
+   /** Project sids currently bound to this vertical. */
+   used_by: string[];
+   operation: VerticalOperation | null;
++  managed_by_host: boolean;
+   /** The only actions the server accepts right now; the UI offers nothing else. */
+   actions: VerticalAction[];
+ }
+@@ -633,6 +634,7 @@
+   verticals: VerticalRow[];
+   catalog: VerticalCatalogStatus;
+   host: {
++    managed_by_host: boolean;
+     store_root: string;
+   };
+ }
+--- a/frontend/web/src/components/WorkPauseBanner.tsx
++++ b/frontend/web/src/components/WorkPauseBanner.tsx
+@@ -1,9 +1,10 @@
+ import type { Snapshot } from '../api';
++import { errorText } from '../lib/format';
+
+ /** A runtime can pause work and supply the reason shown to the operator. */
+ export function WorkPauseBanner({ pause }: { pause: Snapshot['work_pause'] }) {
+   if (!pause) return null;
+   return <div data-work-pause role="alert" className="mx-3 mt-3 rounded-lg border border-err/50 bg-err/10 px-3.5 py-2 text-[13px] leading-5 text-err">
+-    {pause.reason}
++    {errorText(new Error(pause.reason))}
+   </div>;
+ }
