@@ -260,6 +260,25 @@ def test_meter_forwards_a_long_conversation_and_explains_upstream_failures(confi
     assert 'max_output_tokens' not in seen[-1]  # the requested output is no longer cut to 16k
 
 
+def test_a_stream_cut_before_its_receipt_charges_an_estimate_not_the_reservation(config, ledger, monkeypatch, tmp_path):
+    """Twelve broken streams once settled at their full reservations and drained a code's $50 in 17 minutes."""
+    from deploy.native_preview import interrupted_cost
+    key = tmp_path / 'upstream.key'
+    key.write_text('upstream-secret\n')
+    config['upstream'] = {'base_url': 'https://relay.example/v1/', 'token_file': str(key)}
+    def provider(request):
+        return httpx.Response(200, headers={'Content-Type': 'text/event-stream'},
+                              content=b'data: {"type": "response.output_text.delta", "delta": "half"}\n\n')
+    original = httpx.AsyncClient
+    monkeypatch.setattr('deploy.native_preview.httpx.AsyncClient',
+                        lambda **kwargs: original(transport=httpx.MockTransport(provider)))
+    body = {'model': MODEL, 'input': 'x' * 1_000_000, 'stream': True}
+    TestClient(model_app(config, ledger)).post('/v1/responses', headers={'Authorization': 'Bearer meter-a'}, json=body)
+    used = ledger.status('alice')['used_usd']
+    assert 0 < used <= interrupted_cost(1_000_100) + 1e-6
+    assert used < 0.5
+
+
 def test_meter_exhaustion_never_submits_to_provider(config, ledger, monkeypatch):
     ledger.reserve('alice', 10)
     def unexpected(**kwargs):

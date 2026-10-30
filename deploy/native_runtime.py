@@ -90,8 +90,13 @@ async def inside():
     from argus.webapi.server import create_app
     from native_egress import bridge
 
-    resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
-    resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))
+    # No file size cap (wheels such as torch and model weights run to GBs);
+    # open files up to what the host grants. The workspace's total size is
+    # still watched from outside (StorageWatch).
+    resource.setrlimit(resource.RLIMIT_FSIZE, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+    hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+    files = 65536 if hard == resource.RLIM_INFINITY else min(65536, hard)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (files, files))
     model = await asyncio.start_server(lambda r, w: bridge(r, w, target_socket="/meter/model.sock"), "127.0.0.1", 9011)
     proxy = await asyncio.start_server(lambda r, w: bridge(r, w, target_socket="/meter/egress.sock"), "127.0.0.1", 9012)
     socket_path = Path("/tenant/run/web.sock")
@@ -333,7 +338,8 @@ def main():
         # The storage check imports Argus: take the source the tenants run, not
         # an older copy installed in the venv, which made every launcher fail
         # that import and leave its runtime unwatched.
-        sys.path.insert(0, config["source"])
+        if source := config.get("source"):
+            sys.path.insert(0, source)
         command = extra or None
         if command and command[0] == "--":
             command = command[1:]

@@ -240,6 +240,17 @@ def load_config(path: Path) -> dict:
     return value
 
 
+def interrupted_cost(size: int) -> float:
+    """What a call cut off before its receipt most likely cost: its input read
+    once, mostly from cache, and no output. Keeping the whole reservation
+    instead drained a code's allowance a few dollars per broken stream."""
+    from argus.core.pricing import quote_token_usage
+
+    tokens = size // 4
+    quote = quote_token_usage(MODEL, input_tokens=tokens, output_tokens=0, cached_input_tokens=tokens * 9 // 10)
+    return quote.cost_usd if quote.status == "priced" else 0.0
+
+
 def provider_error(status: int, detail: str) -> str:
     """What a failed upstream call means for the person, and what to do."""
     said = f"（模型服务返回 {status}：{detail.strip()[:300]}）" if detail.strip() else f"（模型服务返回 {status}）"
@@ -343,7 +354,7 @@ def model_app(config: dict, ledger: Ledger) -> FastAPI:
             if not handed_off:
                 try:
                     if reservation:
-                        ledger.settle(reservation, None if submitted else 0)
+                        ledger.settle(reservation, interrupted_cost(len(raw)) if submitted else 0)
                 finally:
                     slots.release()
                     if upstream:
@@ -363,7 +374,13 @@ def model_app(config: dict, ledger: Ledger) -> FastAPI:
                         except ValueError:
                             pass
                     yield (line + "\n").encode()
+            except Exception as exc:
+                print(f"meter: {tenant} stream broke: {type(exc).__name__}: {exc}", flush=True)
+                raise
             finally:
+                if charged is None:
+                    print(f"meter: {tenant} call ended without a usage receipt; charged an estimate", flush=True)
+                    charged = interrupted_cost(len(raw))
                 try:
                     ledger.settle(reservation, charged)
                 finally:
