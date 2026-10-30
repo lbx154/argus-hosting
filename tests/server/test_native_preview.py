@@ -233,6 +233,33 @@ def test_meter_sends_to_a_configured_upstream_and_charges_its_usage(config, ledg
     assert ledger.status('alice')['used_usd'] == pytest.approx(expected, abs=1e-6)
 
 
+def test_meter_forwards_a_long_conversation_and_explains_upstream_failures(config, ledger, monkeypatch, tmp_path):
+    """A 3 MB request (a long Codex task, ~140k tokens) used to be refused at 2 MB."""
+    key = tmp_path / 'upstream.key'
+    key.write_text('upstream-secret\n')
+    config['upstream'] = {'base_url': 'https://relay.example/v1/', 'token_file': str(key)}
+    seen, replies = [], [httpx.Response(429, text='slow down')]
+    def provider(request):
+        seen.append(json.loads(request.content))
+        if replies:
+            return replies.pop()
+        event = {'type': 'response.completed', 'response': {'id': 'r', 'status': 'completed', 'output': [],
+                 'usage': {'input_tokens': 100, 'output_tokens': 10}}}
+        return httpx.Response(200, headers={'Content-Type': 'text/event-stream'},
+                              content=('data: ' + json.dumps(event) + '\n\n').encode())
+    original = httpx.AsyncClient
+    monkeypatch.setattr('deploy.native_preview.httpx.AsyncClient',
+                        lambda **kwargs: original(transport=httpx.MockTransport(provider)))
+    client = TestClient(model_app(config, ledger))
+    body = {'model': MODEL, 'input': 'x' * 3_000_000}
+    busy = client.post('/v1/responses', headers={'Authorization': 'Bearer meter-a'}, json=body)
+    assert busy.status_code == 429
+    assert '被限流' in busy.json()['error']['message'] and 'slow down' in busy.json()['error']['message']
+    r = client.post('/v1/responses', headers={'Authorization': 'Bearer meter-a'}, json=body)
+    assert r.status_code == 200
+    assert 'max_output_tokens' not in seen[-1]  # the requested output is no longer cut to 16k
+
+
 def test_meter_exhaustion_never_submits_to_provider(config, ledger, monkeypatch):
     ledger.reserve('alice', 10)
     def unexpected(**kwargs):
@@ -425,6 +452,8 @@ def test_watchdog_accepts_normal_multirole_copilot_memory():
     monitor.process = ClientProcess(1, 1200 * 1024**2, 99)
     assert monitor.exceeded() == ''  # The previously observed 2.2 GiB / 199-thread case must remain usable.
     monitor.process.memory = 9 * 1024**3
+    assert monitor.exceeded() == ''  # A 9 GiB experiment is ordinary work, not a runaway.
+    monitor.process.memory = 65 * 1024**3
     assert monitor.exceeded() == 'memory'
 
 

@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -126,6 +127,10 @@ async def serve_js(package: Path, socket_path: Path, port: int = 8799):
             return
         await asyncio.gather(pipe(reader, upstream), pipe(other_reader, writer))
 
+    # Each tenant runs one runtime, and this namespace is new: an owner left by
+    # the last one is stale. Its pid is often this child's own (pids restart
+    # at 1 per namespace), which Argus would read as "in use" and refuse.
+    (Path(os.environ["ARGUS_HOME"]) / "owner.json").unlink(missing_ok=True)
     child = await asyncio.create_subprocess_exec(
         "node", str(package / "dist/argus.mjs"), "--port", str(port), "--backend", "codex", "--model", MODEL)
     web = await asyncio.start_unix_server(forward, str(socket_path))
@@ -137,62 +142,40 @@ async def serve_js(package: Path, socket_path: Path, port: int = 8799):
 class ResourceWatchdog:
     """Fallback for hosts without delegated cgroup resource controllers.
 
-    Account the entire sandbox process tree, including threads. Stop it on
-    memory/process excess or sustained CPU excess. Limits stay outside guests.
+    Account the entire sandbox process tree, including threads, and stop it
+    only on runaway memory or process counts (preview.json ``limits``
+    ``memory_gb`` and ``tasks``). CPU is never policed: busy work runs slower,
+    it is not cancelled.
     """
-    def __init__(self, pid: int, *, memory_bytes: int = 8 * 1024**3, tasks: int = 512, cpu_core: int | None = None):
+    def __init__(self, pid: int, *, memory_bytes: int = 64 * 1024**3, tasks: int = 16384):
         import psutil
 
         self.process = psutil.Process(pid)
         self.memory_limit = memory_bytes
         self.task_limit = tasks
-        self.cpu_core = cpu_core
         self.memory_bytes = self.threads = 0
-        self.last_cpu: dict[int, float] = {}
-        self.last_at = time.monotonic()
-        self.cpu_excess_since: float | None = None
 
     def exceeded(self) -> str:
         import psutil
 
         memory = threads = 0
-        cpu: dict[int, float] = {}
         try:
             processes = [self.process, *self.process.children(recursive=True)]
         except psutil.NoSuchProcess:
             return ""
         for process in processes:
             try:
-                if self.cpu_core is not None:
-                    for thread in process.threads():
-                        os.sched_setaffinity(thread.id, {self.cpu_core})
                 memory += process.memory_info().rss
                 threads += process.num_threads()
-                times = process.cpu_times()
-                cpu[process.pid] = times.user + times.system + times.children_user + times.children_system
-            except psutil.NoSuchProcess:
-                continue
-            except ProcessLookupError:
+            except (psutil.NoSuchProcess, ProcessLookupError):
                 continue
             except (PermissionError, psutil.AccessDenied):
                 return "resource inspection"
         self.memory_bytes, self.threads = memory, threads
-        now = time.monotonic()
-        elapsed = max(0.01, now - self.last_at)
-        used = sum(max(0, value - self.last_cpu.get(pid, value)) for pid, value in cpu.items()) / elapsed
-        self.last_cpu, self.last_at = cpu, now
         if memory > self.memory_limit:
             return "memory"
         if threads > self.task_limit:
             return "process/thread"
-        if self.cpu_core is not None:
-            return ""  # Kernel affinity enforces CPU capacity without cancelling ordinary work.
-        if used > 1.25:
-            self.cpu_excess_since = self.cpu_excess_since or now
-            if now - self.cpu_excess_since > 5:
-                return "CPU"
-        else:
-            self.cpu_excess_since = None
         return ""
 
 
@@ -347,19 +330,18 @@ def main():
         asyncio.run(inside())
     else:
         config = json.loads(args.config.read_text())
+        # The storage check imports Argus: take the source the tenants run, not
+        # an older copy installed in the venv, which made every launcher fail
+        # that import and leave its runtime unwatched.
+        sys.path.insert(0, config["source"])
         command = extra or None
         if command and command[0] == "--":
             command = command[1:]
-        core = None
-        before_exec = None
-        if args.mode == "launch":
-            # Tenants take cores in name order, so no two share one until all are taken.
-            cores = sorted(os.sched_getaffinity(0))
-            core = cores[sorted(config["tenants"]).index(args.tenant) % len(cores)]
-            before_exec = lambda: os.sched_setaffinity(0, {core})
-        with subprocess.Popen(sandbox_command(config, args.tenant, command), env={}, preexec_fn=before_exec) as child:
+        limits = config.get("limits") or {}
+        with subprocess.Popen(sandbox_command(config, args.tenant, command), env={}) as child:
             directory = config["tenants"][args.tenant]["directory"]
-            watchdog = ResourceWatchdog(child.pid, cpu_core=core)
+            watchdog = ResourceWatchdog(child.pid, memory_bytes=int(float(limits.get("memory_gb", 64)) * 1024**3),
+                                        tasks=int(limits.get("tasks", 16384)))
             storage = StorageWatch(directory, config.get("limits"))
             last_storage = 0.0
             while child.poll() is None:

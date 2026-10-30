@@ -8,7 +8,7 @@
       return originalFetch(request);
     }
     const body = new Uint8Array(await request.arrayBuffer());
-    if (body.length > 2000000) return new Response(JSON.stringify({ detail: '输入内容太长，请缩短后重试。' }), { status: 413 });
+    if (body.length > 256 * 1024 * 1024) return new Response(JSON.stringify({ detail: '这条消息超过 256 MB，发不出去。大文件请放进项目目录，或让 Argus 从网址下载。' }), { status: 413 });
     let encoded = '';
     for (let i = 0; i < body.length; i += 16384) encoded += String.fromCharCode(...body.subarray(i, i + 16384));
     const endpoint = new URL('/trial/stream', location.href);
@@ -25,12 +25,12 @@
     function fail() {
       if (ended) return;
       ended = true; clearTimeout(timer);
-      const error = new Error('连接已中断，请重试。');
+      const error = new Error('和工作区的连接断了，这条消息可能没发出去。请刷新页面看一下，没有的话再发一次。');
       if (!started) rejectStart(error);
       controller.error(error);
       socket.close();
     }
-    const timer = setTimeout(fail, 30000);
+    const timer = setTimeout(fail, 120000);
     socket.onopen = () => socket.send(JSON.stringify({ method: 'POST', path: url.pathname, body: btoa(encoded) }));
     socket.onmessage = event => {
       if (ended) return;

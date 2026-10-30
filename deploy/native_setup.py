@@ -7,7 +7,6 @@ import secrets
 import subprocess
 from pathlib import Path
 
-
 # Codex inside a tenant reaches only the metered endpoint its runtime bridges
 # to 127.0.0.1:9011, with that tenant's own token (ARGUS_METER_TOKEN).
 # requires_openai_auth = false tells Argus's readiness check not to run
@@ -23,8 +22,8 @@ base_url = "http://127.0.0.1:9011/v1"
 env_key = "ARGUS_METER_TOKEN"
 wire_api = "responses"
 requires_openai_auth = false
-request_max_retries = 3
-stream_max_retries = 3
+request_max_retries = 8
+stream_max_retries = 8
 '''
 
 
@@ -97,7 +96,13 @@ def install_services(config: dict, root: Path) -> None:
     for name, command in commands.items():
         # systemd command lines have their own quoting and percent expansion.
         executable = ' '.join(json.dumps(arg.replace('%', '%%')) for arg in command)
-        memory = '8G' if name.startswith(prefix + 'trial') else '512M'
+        # Generous ceilings that keep one runaway from taking the host down;
+        # tenant limits come from preview.json "limits" (memory_gb, cpus, tasks).
+        limits = config.get('limits') or {}
+        tenant = name.startswith(prefix + 'trial')
+        memory = f"{limits.get('memory_gb', 64)}G" if tenant else '4G'
+        cpu = f"{int(limits.get('cpus', 16)) * 100}%" if tenant else '400%'
+        tasks = int(limits.get('tasks', 16384)) if tenant else 4096
         text = f'''[Unit]
 Description=Argus invitation preview {name}
 After=network-online.target
@@ -116,8 +121,8 @@ NoNewPrivileges=yes
 Restart=on-failure
 RestartSec=5
 MemoryMax={memory}
-CPUQuota=100%
-TasksMax=512
+CPUQuota={cpu}
+TasksMax={tasks}
 KillMode=control-group
 TimeoutStopSec=15
 [Install]
