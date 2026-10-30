@@ -33,6 +33,11 @@ def sandbox_command(config: dict, tenant: str, command: list[str] | None = None)
     for name in ("tmp", "shm"):
         (directory / name).mkdir(parents=True, exist_ok=True, mode=0o700)
     args.extend(("--proc", "/proc", "--dev", "/dev", "--dir", "/etc"))
+    if (config.get("limits") or {}).get("gpu", True):
+        # Share the host's NVIDIA GPUs. Only the device nodes are needed: the
+        # driver libraries and nvidia-smi come in with /usr.
+        for device in sorted(Path("/dev").glob("nvidia*")):
+            args.extend(("--dev-bind", str(device), str(device)))
     for path in ("/etc/ssl", "/etc/ca-certificates", "/etc/hosts", "/etc/nsswitch.conf", "/etc/passwd", "/etc/group", "/etc/ld.so.cache"):
         if Path(path).exists():
             args.extend(("--ro-bind", path, path))
@@ -53,9 +58,6 @@ def sandbox_command(config: dict, tenant: str, command: list[str] | None = None)
         "HTTP_PROXY": "http://127.0.0.1:9012", "HTTPS_PROXY": "http://127.0.0.1:9012",
         "http_proxy": "http://127.0.0.1:9012", "https_proxy": "http://127.0.0.1:9012",
         "NO_PROXY": "localhost,127.0.0.1", "no_proxy": "localhost,127.0.0.1",
-        "ARGUS_SKILL_RESEARCH_BUDGET": "2",
-        "ARGUS_SKILL_MANAGER_WARM_CONTEXT_LIMIT": "2",
-        "ARGUS_SKILL_MANAGER_WARM_CONTEXT_IDLE_SECONDS": "180",
     }
     if config.get("agent") == "codex":
         env.update({"ARGUS_SKILL_RUNNER_BACKEND": "codex", "ARGUS_SKILL_RUNNER_BIN": "/tenant/bin/codex",
@@ -76,7 +78,7 @@ def sandbox_command(config: dict, tenant: str, command: list[str] | None = None)
     for role in ("ENGINEER", "REVIEWER", "PLANNER", "MANAGER", "LIGHT"):
         env[f"ARGUS_SKILL_{role}_MODEL"] = MODEL
     # How many of one tenant's projects may run at once (preview.json limits.daemons).
-    env["ARGUS_SKILL_MAX_ACTIVE_DAEMONS"] = str(int((config.get("limits") or {}).get("daemons", 1)))
+    env["ARGUS_SKILL_MAX_ACTIVE_DAEMONS"] = str(int((config.get("limits") or {}).get("daemons", 64)))
     for key, value in env.items():
         args.extend(("--setenv", key, value))
     args.extend(("--chdir", "/tenant/workspace", "--"))
@@ -152,7 +154,7 @@ class ResourceWatchdog:
     ``memory_gb`` and ``tasks``). CPU is never policed: busy work runs slower,
     it is not cancelled.
     """
-    def __init__(self, pid: int, *, memory_bytes: int = 64 * 1024**3, tasks: int = 16384):
+    def __init__(self, pid: int, *, memory_bytes: int = 128 * 1024**3, tasks: int = 65536):
         import psutil
 
         self.process = psutil.Process(pid)
@@ -185,7 +187,7 @@ class ResourceWatchdog:
 
 
 STORAGE_BYTES = 2 * 1024**3
-STORAGE_ENTRIES = 100000
+STORAGE_ENTRIES = 5_000_000  # a few unpacked datasets and environments, not a cap on ordinary work
 
 
 def storage_usage(directory: str | Path) -> tuple[int, int]:
@@ -346,8 +348,8 @@ def main():
         limits = config.get("limits") or {}
         with subprocess.Popen(sandbox_command(config, args.tenant, command), env={}) as child:
             directory = config["tenants"][args.tenant]["directory"]
-            watchdog = ResourceWatchdog(child.pid, memory_bytes=int(float(limits.get("memory_gb", 64)) * 1024**3),
-                                        tasks=int(limits.get("tasks", 16384)))
+            watchdog = ResourceWatchdog(child.pid, memory_bytes=int(float(limits.get("memory_gb", 128)) * 1024**3),
+                                        tasks=int(limits.get("tasks", 65536)))
             storage = StorageWatch(directory, config.get("limits"))
             last_storage = 0.0
             while child.poll() is None:

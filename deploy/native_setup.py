@@ -100,14 +100,13 @@ def install_services(config: dict, root: Path) -> None:
         # tenant limits come from preview.json "limits" (memory_gb, cpus, tasks).
         limits = config.get('limits') or {}
         tenant = name.startswith(prefix + 'trial')
-        memory = f"{limits.get('memory_gb', 64)}G" if tenant else '4G'
-        cpu = f"{int(limits.get('cpus', 16)) * 100}%" if tenant else '400%'
-        tasks = int(limits.get('tasks', 16384)) if tenant else 4096
+        memory = f"{limits.get('memory_gb', 128)}G" if tenant else '8G'
+        cpu = f"{int(limits.get('cpus', 32)) * 100}%" if tenant else '800%'
+        tasks = int(limits.get('tasks', 65536)) if tenant else 8192
         text = f'''[Unit]
 Description=Argus invitation preview {name}
 After=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=4
+StartLimitIntervalSec=0
 [Service]
 Type=simple
 WorkingDirectory={str(source).replace("%", "%%")}
