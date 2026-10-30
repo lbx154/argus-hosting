@@ -366,7 +366,8 @@ RECOVERING = """<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 def portal_app(config: dict, ledger: Ledger) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     invites = {row["invite"]: name for name, row in config["tenants"].items()}
-    login_html = LOGIN.replace("{user}", f"{ledger.user / MICRO:g}").replace("{total}", f"{ledger.total / MICRO:g}")
+    login_html = (LOGIN.replace("{user}", f"{ledger.user / MICRO:g}").replace("{total}", f"{ledger.total / MICRO:g}")
+                  .replace("Argus 6.1 试用", config.get("title", "Argus 6.1 试用")))
     # A session is a random token the portal holds, not a signed claim. Only
     # its hash is kept, next to the ledger, so a portal restart (every deploy)
     # does not sign everyone out and the file cannot be replayed as a cookie.

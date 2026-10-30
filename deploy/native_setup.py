@@ -8,6 +8,23 @@ import subprocess
 from pathlib import Path
 
 
+# Codex inside a tenant reaches only the metered endpoint its runtime bridges
+# to 127.0.0.1:9011, with that tenant's own token (ARGUS_METER_TOKEN).
+CODEX_CONFIG = '''model = "gpt-6.1-sol"
+model_provider = "meter"
+web_search = "disabled"
+model_auto_compact_token_limit = 300000
+
+[model_providers.meter]
+name = "Argus trial meter"
+base_url = "http://127.0.0.1:9011/v1"
+env_key = "ARGUS_METER_TOKEN"
+wire_api = "responses"
+request_max_retries = 3
+stream_max_retries = 3
+'''
+
+
 def initialize(args) -> dict:
     root = args.root.resolve()
     source = args.source.resolve()
@@ -21,11 +38,15 @@ def initialize(args) -> dict:
         return json.loads(path.read_text())
     config = {'model': 'gpt-6.1-sol', 'revision': args.revision, 'source': str(source), 'hosting_source': str(hosting_source),
               'venv': str(args.venv.resolve()), 'python_runtime': str(args.python_runtime.resolve()),
-              'node_runtime': str(args.node_runtime.resolve()), 'copilot_package': str(args.copilot_package.resolve()),
-              'copilot_home': str(Path.home() / '.copilot'), 'ledger': str(root / 'usage.sqlite3'),
+              'node_runtime': str(args.node_runtime.resolve()), 'copilot_home': str(Path.home() / '.copilot'),
+              'ledger': str(root / 'usage.sqlite3'),
               'meter_runtime': str(root / 'meter'), 'total_usd': args.total_usd, 'user_usd': args.user_usd,
-              'concurrency': args.concurrency,
+              'concurrency': args.concurrency, 'name': args.name, 'port': args.port, 'title': args.title,
+              'runtime': args.runtime, 'agent': args.agent,
               'relay_secret': secrets.token_hex(32), 'tenants': {}}
+    for key in ('copilot_package', 'codex_package', 'argus_package'):
+        if value := getattr(args, key):
+            config[key] = str(value.resolve())
     if args.upstream_base_url:
         config['upstream'] = {'base_url': args.upstream_base_url, 'token_file': str(args.upstream_token_file.resolve())}
     (root / 'meter').mkdir(mode=0o700)
@@ -35,10 +56,14 @@ def initialize(args) -> dict:
         directory.mkdir(mode=0o700)
         for part in ('home', 'home/.copilot', 'state', 'run', 'workspace', 'bin'):
             (directory / part).mkdir(mode=0o700)
-        node = args.node_runtime.resolve()
         # A link, not a shell wrapper: Argus's agent sandbox reads the loader's
         # ``#!/usr/bin/env node`` and brings node and the package in with it.
-        (directory / 'bin/copilot').symlink_to(node / 'lib/node_modules/@github/copilot/npm-loader.js')
+        if args.agent == 'codex':
+            (directory / 'bin/codex').symlink_to(Path(config['codex_package']) / 'bin/codex.js')
+            (directory / 'home/.codex').mkdir(mode=0o700)
+            (directory / 'home/.codex/config.toml').write_text(CODEX_CONFIG)
+        else:
+            (directory / 'bin/copilot').symlink_to(args.node_runtime.resolve() / 'lib/node_modules/@github/copilot/npm-loader.js')
         (directory / 'state/identity.md').write_text(
             '你是研究和编程助手。用简明中文说明做了什么、得到什么结果、还需要什么信息。'
             '每个项目有自己的项目目录；提到文件时写相对项目目录的路径（例如 figures/plot.png），不要加 workspace/ 之类的前缀。解释结果时少用内部代码、角色名和工具参数。\n')
@@ -58,17 +83,18 @@ def install_services(config: dict, root: Path) -> None:
     python = str(Path(config['venv']) / 'bin/python')
     units = Path.home() / '.config/systemd/user'
     units.mkdir(parents=True, exist_ok=True)
+    prefix = f"argus-{config.get('name', 'preview')}-"
     commands = {
-        'argus-preview-meter': [python, str(source / 'deploy/native_preview.py'), 'meter', '--config', str(root / 'preview.json'), '--uds', str(root / 'meter/model.sock')],
-        'argus-preview-egress': [python, str(source / 'deploy/native_egress.py'), '--socket', str(root / 'meter/egress.sock')],
-        'argus-preview-portal': [python, str(source / 'deploy/native_preview.py'), 'portal', '--config', str(root / 'preview.json'), '--port', '18871'],
+        prefix + 'meter': [python, str(source / 'deploy/native_preview.py'), 'meter', '--config', str(root / 'preview.json'), '--uds', str(root / 'meter/model.sock')],
+        prefix + 'egress': [python, str(source / 'deploy/native_egress.py'), '--socket', str(root / 'meter/egress.sock')],
+        prefix + 'portal': [python, str(source / 'deploy/native_preview.py'), 'portal', '--config', str(root / 'preview.json'), '--port', str(config.get('port', 18871))],
     }
     for name in config['tenants']:
-        commands['argus-preview-' + name] = [python, str(source / 'deploy/native_runtime.py'), 'launch', '--config', str(root / 'preview.json'), '--tenant', name]
+        commands[prefix + name] = [python, str(source / 'deploy/native_runtime.py'), 'launch', '--config', str(root / 'preview.json'), '--tenant', name]
     for name, command in commands.items():
         # systemd command lines have their own quoting and percent expansion.
         executable = ' '.join(json.dumps(arg.replace('%', '%%')) for arg in command)
-        memory = '8G' if name.startswith('argus-preview-trial') else '512M'
+        memory = '8G' if name.startswith(prefix + 'trial') else '512M'
         text = f'''[Unit]
 Description=Argus invitation preview {name}
 After=network-online.target
@@ -103,8 +129,16 @@ WantedBy=default.target
 
 def main():
     parser = argparse.ArgumentParser()
-    for name in ('root', 'source', 'hosting-source', 'venv', 'python-runtime', 'node-runtime', 'copilot-package'):
+    for name in ('root', 'source', 'hosting-source', 'venv', 'python-runtime', 'node-runtime'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--copilot-package', type=Path, help="Copilot CLI's extracted packages (--agent copilot)")
+    parser.add_argument('--codex-package', type=Path, help='the @openai/codex package directory (--agent codex)')
+    parser.add_argument('--argus-package', type=Path, help='the installed @lbx154/argus package directory (--runtime js)')
+    parser.add_argument('--name', default='preview', help='names the services argus-NAME-*')
+    parser.add_argument('--port', type=int, default=18871, help='loopback port of the portal')
+    parser.add_argument('--title', default='Argus 6.1 试用')
+    parser.add_argument('--runtime', choices=('python', 'js'), default='python', help='the Argus each invitation runs')
+    parser.add_argument('--agent', choices=('copilot', 'codex'), default='copilot', help='the CLI its roles run')
     parser.add_argument('--revision', required=True)
     parser.add_argument('--tenants', type=int, default=5)
     parser.add_argument('--user-usd', type=float, default=10)
@@ -116,6 +150,10 @@ def main():
     args = parser.parse_args()
     if bool(args.upstream_base_url) != bool(args.upstream_token_file):
         parser.error('--upstream-base-url and --upstream-token-file go together')
+    for needed, flag in ((args.agent == 'copilot', 'copilot_package'), (args.agent == 'codex', 'codex_package'),
+                         (args.runtime == 'js', 'argus_package')):
+        if needed and not getattr(args, flag):
+            parser.error(f"--{flag.replace('_', '-')} is required here")
     config = initialize(args)
     if args.install_services:
         install_services(config, args.root.resolve())

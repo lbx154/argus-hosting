@@ -35,26 +35,20 @@ def sandbox_command(config: dict, tenant: str, command: list[str] | None = None)
     for path in ("/etc/ssl", "/etc/ca-certificates", "/etc/hosts", "/etc/nsswitch.conf", "/etc/passwd", "/etc/group", "/etc/ld.so.cache"):
         if Path(path).exists():
             args.extend(("--ro-bind", path, path))
-    for path in (source, hosting_source, python, venv, node):
+    packages = [config[key] for key in ("codex_package", "argus_package") if key in config]
+    for path in (source, hosting_source, python, venv, node, *packages):
         args.extend(("--ro-bind", str(path), str(path)))
-    args.extend(("--bind", row["directory"], "/tenant", "--ro-bind", config["meter_runtime"], "/meter",
-                 "--ro-bind", config["copilot_package"], "/tenant/home/.cache/copilot/pkg",
-                 "--bind", str(directory / "tmp"), "/tmp", "--bind", str(directory / "shm"), "/dev/shm",
+    args.extend(("--bind", row["directory"], "/tenant", "--ro-bind", config["meter_runtime"], "/meter"))
+    if "copilot_package" in config:
+        args.extend(("--ro-bind", config["copilot_package"], "/tenant/home/.cache/copilot/pkg"))
+    args.extend(("--bind", str(directory / "tmp"), "/tmp", "--bind", str(directory / "shm"), "/dev/shm",
                  "--remount-ro", "/dev", "--remount-ro", "/"))
     env = {
         "HOME": "/tenant/home", "PATH": f"/tenant/bin:{venv}/bin:{node}/bin:/usr/bin:/bin",
         "PYTHONPATH": os.pathsep.join((str(source), str(hosting_source))), "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
         "LANG": "C.UTF-8", "TMPDIR": "/tmp", "ARGUS_SKILL_HOME": "/tenant/state",
         "ARGUS_SKILL_SOURCE_ROOT": str(source), "ARGUS_SKILL_BUILD_REVISION": config["revision"],
-        "ARGUS_SKILL_WEB_TOKEN": row["web_token"], "ARGUS_SKILL_COPILOT_TRIAL": "0",
-        "ARGUS_SKILL_RUNNER_BACKEND": "copilot", "ARGUS_SKILL_MODEL": MODEL,
-        "ARGUS_SKILL_RUNNER_BIN": "/tenant/bin/copilot", "COPILOT_HOME": "/tenant/home/.copilot",
-        "COPILOT_MODEL": MODEL, "COPILOT_PROVIDER_MODEL_ID": MODEL,
-        "COPILOT_PROVIDER_WIRE_MODEL": MODEL, "COPILOT_PROVIDER_TYPE": "openai",
-        "COPILOT_PROVIDER_WIRE_API": "responses", "COPILOT_PROVIDER_TRANSPORT": "http",
-        "COPILOT_PROVIDER_BASE_URL": "http://127.0.0.1:9011/v1",
-        "COPILOT_PROVIDER_BEARER_TOKEN": row["model_token"],
-        "COPILOT_PROVIDER_MAX_PROMPT_TOKENS": "128000", "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS": "16384",
+        "ARGUS_SKILL_WEB_TOKEN": row["web_token"], "ARGUS_SKILL_COPILOT_TRIAL": "0", "ARGUS_SKILL_MODEL": MODEL,
         "HTTP_PROXY": "http://127.0.0.1:9012", "HTTPS_PROXY": "http://127.0.0.1:9012",
         "http_proxy": "http://127.0.0.1:9012", "https_proxy": "http://127.0.0.1:9012",
         "NO_PROXY": "localhost,127.0.0.1", "no_proxy": "localhost,127.0.0.1",
@@ -62,6 +56,22 @@ def sandbox_command(config: dict, tenant: str, command: list[str] | None = None)
         "ARGUS_SKILL_MANAGER_WARM_CONTEXT_LIMIT": "2",
         "ARGUS_SKILL_MANAGER_WARM_CONTEXT_IDLE_SECONDS": "180",
     }
+    if config.get("agent") == "codex":
+        env.update({"ARGUS_SKILL_RUNNER_BACKEND": "codex", "ARGUS_SKILL_RUNNER_BIN": "/tenant/bin/codex",
+                    "CODEX_HOME": "/tenant/home/.codex", "ARGUS_METER_TOKEN": row["model_token"]})
+    else:
+        env.update({
+            "ARGUS_SKILL_RUNNER_BACKEND": "copilot", "ARGUS_SKILL_RUNNER_BIN": "/tenant/bin/copilot",
+            "COPILOT_HOME": "/tenant/home/.copilot", "COPILOT_MODEL": MODEL, "COPILOT_PROVIDER_MODEL_ID": MODEL,
+            "COPILOT_PROVIDER_WIRE_MODEL": MODEL, "COPILOT_PROVIDER_TYPE": "openai",
+            "COPILOT_PROVIDER_WIRE_API": "responses", "COPILOT_PROVIDER_TRANSPORT": "http",
+            "COPILOT_PROVIDER_BASE_URL": "http://127.0.0.1:9011/v1",
+            "COPILOT_PROVIDER_BEARER_TOKEN": row["model_token"],
+            "COPILOT_PROVIDER_MAX_PROMPT_TOKENS": "128000", "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS": "16384",
+        })
+    if config.get("runtime") == "js":
+        env.update({"ARGUS_HOME": "/tenant/state", "ARGUS_WEB_TOKEN": row["web_token"],
+                    "ARGUS_TRIAL_PACKAGE": config["argus_package"]})
     for role in ("ENGINEER", "REVIEWER", "PLANNER", "MANAGER", "LIGHT"):
         env[f"ARGUS_SKILL_{role}_MODEL"] = MODEL
     # How many of one tenant's projects may run at once (preview.json limits.daemons).
@@ -85,10 +95,43 @@ async def inside():
     proxy = await asyncio.start_server(lambda r, w: bridge(r, w, target_socket="/meter/egress.sock"), "127.0.0.1", 9012)
     socket_path = Path("/tenant/run/web.sock")
     socket_path.unlink(missing_ok=True)
-    app = create_app(global_root="/tenant/state")
-    server = uvicorn.Server(uvicorn.Config(app, uds=str(socket_path), access_log=False, proxy_headers=False))
     async with model, proxy:
+        if package := os.environ.get("ARGUS_TRIAL_PACKAGE"):
+            await serve_js(Path(package), socket_path)
+            return
+        app = create_app(global_root="/tenant/state")
+        server = uvicorn.Server(uvicorn.Config(app, uds=str(socket_path), access_log=False, proxy_headers=False))
         await server.serve()
+
+
+async def serve_js(package: Path, socket_path: Path, port: int = 8799):
+    """The TypeScript Argus serves TCP inside the tenant's own network; the
+    portal reaches it through the same Unix socket a Python runtime listens on."""
+    async def pipe(reader, writer):
+        # No idle or size bound: page streams stay open while work runs.
+        try:
+            while chunk := await reader.read(65536):
+                writer.write(chunk)
+                await writer.drain()
+        except OSError:
+            pass
+        finally:
+            writer.close()
+
+    async def forward(reader, writer):
+        try:
+            other_reader, upstream = await asyncio.open_connection("127.0.0.1", port)
+        except OSError:
+            writer.close()
+            return
+        await asyncio.gather(pipe(reader, upstream), pipe(other_reader, writer))
+
+    child = await asyncio.create_subprocess_exec(
+        "node", str(package / "dist/argus.mjs"), "--port", str(port), "--backend", "codex", "--model", MODEL)
+    web = await asyncio.start_unix_server(forward, str(socket_path))
+    async with web:
+        code = await child.wait()
+    raise SystemExit(code)
 
 
 class ResourceWatchdog:
