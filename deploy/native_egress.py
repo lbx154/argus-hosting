@@ -20,12 +20,10 @@ async def public_address(host: str, port: int) -> str:
 
 
 async def copy_stream(reader, writer):
-    transferred = 0
+    # No idle or size cap: model weights, datasets and wheels such as torch
+    # run to gigabytes, and slow mirrors pause for minutes.
     try:
-        while chunk := await asyncio.wait_for(reader.read(65536), 120):
-            transferred += len(chunk)
-            if transferred > 100 * 1024 * 1024:
-                break
+        while chunk := await reader.read(65536):
             writer.write(chunk)
             await writer.drain()
     finally:
@@ -43,6 +41,13 @@ async def bridge(reader, writer, *, target_socket: str):
         writer.close()
         if upstream:
             upstream.close()
+
+
+def refuse(writer, status: str, reason: str) -> None:
+    """Say why, so a failed download names its cause instead of a bare 403."""
+    body = (reason + "\n").encode()
+    writer.write(f"HTTP/1.1 {status}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                 f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
 
 
 async def handle_proxy(reader, writer):
@@ -78,9 +83,12 @@ async def handle_proxy(reader, writer):
             await upstream.drain()
         await writer.drain()
         await asyncio.gather(copy_stream(reader, upstream), copy_stream(other_reader, writer))
-    except (ValueError, OSError, TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+    except ValueError as exc:
         if upstream is None:
-            writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+            refuse(writer, "403 Forbidden", f"blocked by the trial sandbox: {exc}")
+    except (OSError, TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError) as exc:
+        if upstream is None:
+            refuse(writer, "502 Bad Gateway", f"could not reach the destination: {type(exc).__name__}: {exc}")
     finally:
         writer.close()
         if upstream:

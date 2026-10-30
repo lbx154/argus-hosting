@@ -30,12 +30,20 @@ MODEL = "gpt-6.1-sol"
 MICRO = 1_000_000
 # Twice the authoritative rates observed from Copilot token_details for this
 # model: input/cache-write <= $2.50/M, output/reasoning $10/M. Reserve from
-# UTF-8 bytes (an upper bound on text tokens), framing and enforced output cap.
+# UTF-8 bytes (an upper bound on text tokens), framing and the requested output.
 INPUT_CEILING = 5.0 / MICRO
 OUTPUT_CEILING = 20.0 / MICRO
-MAX_BODY = 2_000_000
-MAX_OUTPUT = 16384
+# Only protects the meter's memory. Codex compacts a conversation long before
+# its requests get near this; a 2 MB cap here used to fail long tasks outright.
+MAX_BODY = 64 * 1024 * 1024
+DEFAULT_OUTPUT = 32768  # reserved for when a request names no output cap
+# A reservation holds money only while its call runs and settles at the real
+# cost, which for a long conversation is mostly cached input. Capping it keeps
+# one long call from blocking the tenant's parallel calls on money it won't spend.
+MAX_RESERVATION = 1.0
 MIN_ADMIT = 10_000  # $0.01 in micro-dollars
+UPLOAD_LIMIT = 256 * 1024 * 1024  # one browser upload, buffered by the portal
+RETRY_LATER = "会自动重试；如果任务还是停了，稍后在对话里说“继续”即可接着做，已有文件都保留着。"
 
 
 async def bounded_body(request: Request, maximum: int) -> bytes:
@@ -94,7 +102,11 @@ class Ledger:
             left = min(self.total - total, self.user - used)
             if left < min(amount, MIN_ADMIT):
                 db.rollback()
-                raise QuotaExceeded("试用额度已用完，任务已暂停，已有文件都保留着。")
+                if self.total - total < self.user - used:
+                    raise QuotaExceeded(f"试用额度已用完：这一版全站共 {self.total / MICRO:g} 美元的额度已经用完，"
+                                        "任务已暂停，已有文件都保留着。需要继续请联系提供邀请码的人加额度。")
+                raise QuotaExceeded(f"试用额度已用完：这个邀请码的 {self.user / MICRO:g} 美元已经用完，"
+                                    "任务已暂停，已有文件都保留着。需要继续请联系提供邀请码的人加额度。")
             amount = min(amount, left)
             identity = secrets.token_hex(16)
             db.execute("INSERT INTO charges VALUES(?,?,?,?,?)", (identity, tenant, amount, "reserved", time.time()))
@@ -228,6 +240,32 @@ def load_config(path: Path) -> dict:
     return value
 
 
+def interrupted_cost(size: int) -> float:
+    """What a call cut off before its receipt most likely cost: its input read
+    once, mostly from cache, and no output. Keeping the whole reservation
+    instead drained a code's allowance a few dollars per broken stream."""
+    from argus.core.pricing import quote_token_usage
+
+    tokens = size // 4
+    quote = quote_token_usage(MODEL, input_tokens=tokens, output_tokens=0, cached_input_tokens=tokens * 9 // 10)
+    return quote.cost_usd if quote.status == "priced" else 0.0
+
+
+def provider_error(status: int, detail: str) -> str:
+    """What a failed upstream call means for the person, and what to do."""
+    said = f"（模型服务返回 {status}：{detail.strip()[:300]}）" if detail.strip() else f"（模型服务返回 {status}）"
+    if status == 413:
+        return ("这一轮对话太长，超过了模型服务单次能接收的上限，任务停了下来。请新建一个项目，"
+                "把要接着做的事说清楚，已有文件都在原项目里。" + said)
+    if status == 429:
+        return "模型服务暂时繁忙（被限流），" + RETRY_LATER + said
+    if status in (401, 403):
+        return "模型服务的授权出了问题，这不是你的操作造成的，请联系提供邀请码的人。" + said
+    if status in (400, 404, 422):
+        return "模型服务拒绝了这次请求，任务停了下来。请把这条消息发给提供邀请码的人。" + said
+    return "模型服务出错，" + RETRY_LATER + said
+
+
 def model_app(config: dict, ledger: Ledger) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     slots = asyncio.Semaphore(config.get("concurrency", 2))
@@ -255,29 +293,34 @@ def model_app(config: dict, ledger: Ledger) -> FastAPI:
         try:
             raw = await bounded_body(request, MAX_BODY)
         except ValueError:
-            return JSONResponse({"error": {"message": "输入内容太长，请缩短后重试。"}}, 413)
+            return JSONResponse({"error": {"message": f"这次请求超过 {MAX_BODY // 1024 // 1024} MB，模型服务收不下，任务停了下来。"
+                                                      "通常是对话里放进了很大的文件或图片：请新建一个项目继续，"
+                                                      "大文件放在项目目录里让 Argus 只读需要的部分。"}}, 413)
         try:
             payload = json.loads(raw)
-            if not isinstance(payload, dict) or payload.get("model") != MODEL:
+            if not isinstance(payload, dict):
                 raise ValueError
-            requested = payload.get("max_output_tokens", MAX_OUTPUT)
-            if type(requested) is not int or requested <= 0:
+            if payload.get("model") != MODEL:
+                return JSONResponse({"error": {"message": f"试用版只提供 {MODEL} 模型，这次请求用的是 "
+                                                          f"{payload.get('model')!r}。请联系提供邀请码的人。"}}, 400)
+            requested = payload.get("max_output_tokens")
+            if requested is not None and (type(requested) is not int or requested <= 0):
                 raise ValueError
-            output_limit = min(requested, MAX_OUTPUT)
             tools = payload.get("tools", [])
             if not isinstance(tools, list) or any(not isinstance(tool, dict) for tool in tools):
                 raise ValueError
         except (ValueError, TypeError):
-            return JSONResponse({"error": {"message": "此试用版仅支持 GPT-6.1 Sol。"}}, 400)
+            return JSONResponse({"error": {"message": "模型请求的格式不对，任务停了下来。请把这条消息发给提供邀请码的人。"}}, 400)
         was_streaming = payload.get("stream", False)
-        payload.update(stream=True, max_output_tokens=output_limit, store=False, background=False)
+        payload.update(stream=True, store=False, background=False)
         payload.pop("previous_response_id", None)
         refusal, dropped = admit(payload, priced_by_usage=bool(config.get("upstream")))
         if dropped:
             print(f"meter: {tenant} request without {', '.join(sorted(dropped))}", flush=True)
         if refusal:
             print(f"meter: {tenant} refused: {refusal}", flush=True)
-            return JSONResponse({"error": {"message": "试用版支持文字和代码任务，请把附件内容粘贴为文字。"}}, 400)
+            return JSONResponse({"error": {"message": f"请求里有试用版无法计费的内容（{refusal}，例如网址形式的图片或文件），"
+                                                      "任务停了下来。请把文件保存到项目目录，再让 Argus 打开它。"}}, 400)
         await slots.acquire()
         reservation = None
         client = None
@@ -285,29 +328,33 @@ def model_app(config: dict, ledger: Ledger) -> FastAPI:
         submitted = False
         handed_off = False
         try:
-            reservation = ledger.reserve(tenant, (len(raw) + 4096) * INPUT_CEILING + output_limit * OUTPUT_CEILING)
+            reservation = ledger.reserve(tenant, min(MAX_RESERVATION, (len(raw) + 4096) * INPUT_CEILING
+                                                     + (requested or DEFAULT_OUTPUT) * OUTPUT_CEILING))
             url, headers, charge = upstream_request(config)
-            client = httpx.AsyncClient(timeout=httpx.Timeout(300, connect=15), follow_redirects=False, trust_env=False)
+            client = httpx.AsyncClient(timeout=httpx.Timeout(1800, connect=15), follow_redirects=False, trust_env=False)
             submitted = True
             upstream = await client.send(client.build_request("POST", url,
                                                              headers=headers, json=payload), stream=True)
             if upstream.status_code != 200:
                 status = upstream.status_code
-                ledger.settle(reservation, 0 if status in (400, 401, 403, 404, 422, 429) else None)
+                detail = (await upstream.aread()).decode(errors="replace")
+                ledger.settle(reservation, 0 if status in (400, 401, 403, 404, 413, 422, 429) else None)
                 reservation = None
                 await upstream.aclose()
                 upstream = None
-                return JSONResponse({"error": {"message": "模型服务未能完成请求。", "code": "provider_unavailable"}}, status)
+                print(f"meter: {tenant} upstream {status}: {detail[:300]}", flush=True)
+                return JSONResponse({"error": {"message": provider_error(status, detail), "code": "provider_unavailable"}}, status)
             handed_off = True
         except QuotaExceeded as exc:
             return JSONResponse({"error": {"code": "trial_budget_exhausted", "message": str(exc)}}, 402)
-        except Exception:
-            return JSONResponse({"error": {"message": "模型连接暂时不可用，请稍后重试。"}}, 502)
+        except Exception as exc:
+            print(f"meter: {tenant} upstream unreachable: {type(exc).__name__}: {exc}", flush=True)
+            return JSONResponse({"error": {"message": f"连不上模型服务（{type(exc).__name__}），" + RETRY_LATER}}, 502)
         finally:
             if not handed_off:
                 try:
                     if reservation:
-                        ledger.settle(reservation, None if submitted else 0)
+                        ledger.settle(reservation, interrupted_cost(len(raw)) if submitted else 0)
                 finally:
                     slots.release()
                     if upstream:
@@ -327,7 +374,13 @@ def model_app(config: dict, ledger: Ledger) -> FastAPI:
                         except ValueError:
                             pass
                     yield (line + "\n").encode()
+            except Exception as exc:
+                print(f"meter: {tenant} stream broke: {type(exc).__name__}: {exc}", flush=True)
+                raise
             finally:
+                if charged is None:
+                    print(f"meter: {tenant} call ended without a usage receipt; charged an estimate", flush=True)
+                    charged = interrupted_cost(len(raw))
                 try:
                     ledger.settle(reservation, charged)
                 finally:
@@ -346,7 +399,7 @@ def model_app(config: dict, ledger: Ledger) -> FastAPI:
                         final = event["response"]
                 except ValueError:
                     pass
-        return JSONResponse(final or {"error": {"message": "模型没有返回完整结果。"}}, 200 if final else 502)
+        return JSONResponse(final or {"error": {"message": "模型没有返回完整结果，" + RETRY_LATER}}, 200 if final else 502)
 
     return app
 
@@ -360,13 +413,25 @@ LOGIN = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="v
 RECOVERING = """<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="5">
 <title>工作区暂时不可用 · Argus</title><style>body{font:16px system-ui;background:#f6f7f9;color:#172333;margin:0}main{max-width:440px;margin:12vh auto;padding:32px;background:white;border-radius:18px}p{line-height:1.7;color:#536071}a{color:#2069d1}</style>
-<main><h1>正在重新连接你的工作区</h1><p>你的文件和试用余额已保留。页面每 5 秒重试连接。</p><p>如果一直无法连接，请联系试用版管理员。</p><a href="/">立即重试</a></main></html>"""
+<main><h1>正在重新连接你的工作区</h1><p>{reason}</p><p>你的文件和试用余额已保留。页面每 5 秒重试连接。</p><p>如果一直无法连接，请联系提供邀请码的人。</p><a href="/">立即重试</a></main></html>"""
+
+
+def unreachable_reason(row: dict) -> str:
+    """Why a tenant's workspace does not answer, in words its user can act on."""
+    try:
+        pause = json.loads((Path(row["directory"]) / "state" / "storage-pause.json").read_text())
+        used, limit = pause["used_bytes"] / 1024**3, pause["limit_bytes"] / 1024**3
+    except (OSError, ValueError, KeyError, TypeError):
+        return "工作区正在重启（通常是更新或自动恢复），一般几秒钟就好。"
+    return (f"这个邀请码的工作区已经用了 {used:.1f} GB，超过 {limit:.0f} GB 的存储上限，所以运行暂停了。"
+            "请联系提供邀请码的人清理文件或增加空间，之后会自动接着做。")
 
 
 def portal_app(config: dict, ledger: Ledger) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     invites = {row["invite"]: name for name, row in config["tenants"].items()}
-    login_html = LOGIN.replace("{user}", f"{ledger.user / MICRO:g}").replace("{total}", f"{ledger.total / MICRO:g}")
+    login_html = (LOGIN.replace("{user}", f"{ledger.user / MICRO:g}").replace("{total}", f"{ledger.total / MICRO:g}")
+                  .replace("Argus 6.1 试用", config.get("title", "Argus 6.1 试用")))
     # A session is a random token the portal holds, not a signed claim. Only
     # its hash is kept, next to the ledger, so a portal restart (every deploy)
     # does not sign everyone out and the file cannot be replayed as a cookie.
@@ -471,7 +536,7 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
             frame["headers"] = {"cookie": socket.headers.get("cookie", ""),
                                 "origin": socket.headers["origin"], "content-type": "application/json"}
         raw = base64.b64decode(frame.get("body", ""), validate=True)
-        if len(raw) > 16 * 1024 * 1024:
+        if len(raw) > UPLOAD_LIMIT:
             await socket.close(code=4400)
             return
         request_headers = [(k.lower().encode(), v.encode()) for k, v in frame.get("headers", {}).items()
@@ -526,7 +591,7 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
         await socket.accept()
         query = {key: value for key, value in socket.query_params.items() if key != "token"}
         try:
-            async with unix_connect(row["socket"], uri="ws://localhost/api/" + path + "?" + urlencode(query), max_size=8 * 1024 * 1024,
+            async with unix_connect(row["socket"], uri="ws://localhost/api/" + path + "?" + urlencode(query), max_size=None,
                                     extra_headers={"Authorization": "Bearer " + row["web_token"]}) as backend:
                 async def outward():
                     async for message in backend:
@@ -556,13 +621,13 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
         if request.method not in ("GET", "HEAD") and (path.endswith("/config/set") or path.endswith("/budget")):
             return JSONResponse({"detail": "试用版固定使用 GPT-6.1，额度由管理员设置。"}, 403)
         try:
-            body = await bounded_body(request, 16 * 1024 * 1024)
+            body = await bounded_body(request, UPLOAD_LIMIT)
         except ValueError:
-            return JSONResponse({"detail": "文件太大，请缩小后重试。"}, 413)
+            return JSONResponse({"detail": f"单个文件不能超过 {UPLOAD_LIMIT // 1024 // 1024} MB。更大的数据请让 Argus 从网址下载到项目里。"}, 413)
         row = config["tenants"][tenant]
         headers = {k: v for k, v in request.headers.items() if k.lower() in ("content-type", "accept", "accept-language", "range")}
         headers["Authorization"] = "Bearer " + row["web_token"]
-        client = httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=row["socket"]), timeout=httpx.Timeout(600, connect=10))
+        client = httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=row["socket"]), timeout=httpx.Timeout(None, connect=10))
         try:
             response = await client.send(client.build_request(request.method, "http://localhost/" + path +
                                                              ("?" + str(request.url.query) if request.url.query else ""),
@@ -570,9 +635,10 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
         except httpx.HTTPError:
             await client.aclose()
             headers = {"Retry-After": "5", "Cache-Control": "no-store"}
+            reason = unreachable_reason(row)
             if path == "":
-                return HTMLResponse(RECOVERING, 503, headers=headers)
-            return JSONResponse({"detail": "工作区暂时无法连接，文件和余额已保留，请稍后重试。"}, 503, headers=headers)
+                return HTMLResponse(RECOVERING.replace("{reason}", reason), 503, headers=headers)
+            return JSONResponse({"detail": reason + "文件和余额都已保留。"}, 503, headers=headers)
         response_headers = {k: v for k, v in response.headers.items() if k.lower() not in ("content-length", "transfer-encoding", "connection", "content-encoding")}
         if path == "" and response.status_code == 200:
             from fastapi.responses import Response

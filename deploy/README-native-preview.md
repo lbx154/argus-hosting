@@ -123,3 +123,21 @@ can change the address. Non-browser clients must use the authenticated
 `/trial/stream` protocol or a named tunnel / Worker for streamed requests.
 All main and auxiliary model routes are pinned to GPT-6.1 Sol, including front
 door classification, bounded planning, plan preview and prompt rewriting.
+
+## Several versions on one address
+
+One host can serve several previews side by side, e.g. the Python Argus and the
+TypeScript Argus at `/py/` and `/js/` of one domain. Initialize each root with its
+own `--name`, `--port` and `--title`; `--runtime js --argus-package DIR` runs the
+installed `@lbx154/argus` package in each tenant instead of the Python web app.
+`--agent codex --codex-package DIR` gives the roles Codex instead of Copilot CLI:
+each tenant's `home/.codex/config.toml` points at the metered endpoint with that
+tenant's token, and the meter's `--upstream-base-url` names where it forwards.
+Each root keeps its own invitations, ledger and limits.
+
+`try_router.py --version py=18871 --version js=18872` serves the domain: its root is
+a page choosing a version, and each prefix reaches that version's portal. Point the
+named tunnel at the router, not at a portal. The router renames portal cookies per
+version and adds the prefix back to redirects and to pages' WebSocket and history
+calls; other absolute-path requests are placed by their Referer, else by the
+version the browser opened last.

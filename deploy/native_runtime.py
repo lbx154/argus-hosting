@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -32,40 +33,52 @@ def sandbox_command(config: dict, tenant: str, command: list[str] | None = None)
     for name in ("tmp", "shm"):
         (directory / name).mkdir(parents=True, exist_ok=True, mode=0o700)
     args.extend(("--proc", "/proc", "--dev", "/dev", "--dir", "/etc"))
+    if (config.get("limits") or {}).get("gpu", True):
+        # Share the host's NVIDIA GPUs. Only the device nodes are needed: the
+        # driver libraries and nvidia-smi come in with /usr.
+        for device in sorted(Path("/dev").glob("nvidia*")):
+            args.extend(("--dev-bind", str(device), str(device)))
     for path in ("/etc/ssl", "/etc/ca-certificates", "/etc/hosts", "/etc/nsswitch.conf", "/etc/passwd", "/etc/group", "/etc/ld.so.cache"):
         if Path(path).exists():
             args.extend(("--ro-bind", path, path))
-    for path in (source, hosting_source, python, venv, node):
+    packages = [config[key] for key in ("codex_package", "argus_package") if key in config]
+    for path in (source, hosting_source, python, venv, node, *packages):
         args.extend(("--ro-bind", str(path), str(path)))
-    args.extend(("--bind", row["directory"], "/tenant", "--ro-bind", config["meter_runtime"], "/meter",
-                 "--ro-bind", config["copilot_package"], "/tenant/home/.cache/copilot/pkg",
-                 "--bind", str(directory / "tmp"), "/tmp", "--bind", str(directory / "shm"), "/dev/shm",
+    args.extend(("--bind", row["directory"], "/tenant", "--ro-bind", config["meter_runtime"], "/meter"))
+    if "copilot_package" in config:
+        args.extend(("--ro-bind", config["copilot_package"], "/tenant/home/.cache/copilot/pkg"))
+    args.extend(("--bind", str(directory / "tmp"), "/tmp", "--bind", str(directory / "shm"), "/dev/shm",
                  "--remount-ro", "/dev", "--remount-ro", "/"))
     env = {
         "HOME": "/tenant/home", "PATH": f"/tenant/bin:{venv}/bin:{node}/bin:/usr/bin:/bin",
         "PYTHONPATH": os.pathsep.join((str(source), str(hosting_source))), "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
         "LANG": "C.UTF-8", "TMPDIR": "/tmp", "ARGUS_SKILL_HOME": "/tenant/state",
         "ARGUS_SKILL_SOURCE_ROOT": str(source), "ARGUS_SKILL_BUILD_REVISION": config["revision"],
-        "ARGUS_SKILL_WEB_TOKEN": row["web_token"], "ARGUS_SKILL_COPILOT_TRIAL": "0",
-        "ARGUS_SKILL_RUNNER_BACKEND": "copilot", "ARGUS_SKILL_MODEL": MODEL,
-        "ARGUS_SKILL_RUNNER_BIN": "/tenant/bin/copilot", "COPILOT_HOME": "/tenant/home/.copilot",
-        "COPILOT_MODEL": MODEL, "COPILOT_PROVIDER_MODEL_ID": MODEL,
-        "COPILOT_PROVIDER_WIRE_MODEL": MODEL, "COPILOT_PROVIDER_TYPE": "openai",
-        "COPILOT_PROVIDER_WIRE_API": "responses", "COPILOT_PROVIDER_TRANSPORT": "http",
-        "COPILOT_PROVIDER_BASE_URL": "http://127.0.0.1:9011/v1",
-        "COPILOT_PROVIDER_BEARER_TOKEN": row["model_token"],
-        "COPILOT_PROVIDER_MAX_PROMPT_TOKENS": "128000", "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS": "16384",
+        "ARGUS_SKILL_WEB_TOKEN": row["web_token"], "ARGUS_SKILL_COPILOT_TRIAL": "0", "ARGUS_SKILL_MODEL": MODEL,
         "HTTP_PROXY": "http://127.0.0.1:9012", "HTTPS_PROXY": "http://127.0.0.1:9012",
         "http_proxy": "http://127.0.0.1:9012", "https_proxy": "http://127.0.0.1:9012",
         "NO_PROXY": "localhost,127.0.0.1", "no_proxy": "localhost,127.0.0.1",
-        "ARGUS_SKILL_RESEARCH_BUDGET": "2",
-        "ARGUS_SKILL_MANAGER_WARM_CONTEXT_LIMIT": "2",
-        "ARGUS_SKILL_MANAGER_WARM_CONTEXT_IDLE_SECONDS": "180",
     }
+    if config.get("agent") == "codex":
+        env.update({"ARGUS_SKILL_RUNNER_BACKEND": "codex", "ARGUS_SKILL_RUNNER_BIN": "/tenant/bin/codex",
+                    "CODEX_HOME": "/tenant/home/.codex", "ARGUS_METER_TOKEN": row["model_token"]})
+    else:
+        env.update({
+            "ARGUS_SKILL_RUNNER_BACKEND": "copilot", "ARGUS_SKILL_RUNNER_BIN": "/tenant/bin/copilot",
+            "COPILOT_HOME": "/tenant/home/.copilot", "COPILOT_MODEL": MODEL, "COPILOT_PROVIDER_MODEL_ID": MODEL,
+            "COPILOT_PROVIDER_WIRE_MODEL": MODEL, "COPILOT_PROVIDER_TYPE": "openai",
+            "COPILOT_PROVIDER_WIRE_API": "responses", "COPILOT_PROVIDER_TRANSPORT": "http",
+            "COPILOT_PROVIDER_BASE_URL": "http://127.0.0.1:9011/v1",
+            "COPILOT_PROVIDER_BEARER_TOKEN": row["model_token"],
+            "COPILOT_PROVIDER_MAX_PROMPT_TOKENS": "128000", "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS": "16384",
+        })
+    if config.get("runtime") == "js":
+        env.update({"ARGUS_HOME": "/tenant/state", "ARGUS_WEB_TOKEN": row["web_token"],
+                    "ARGUS_TRIAL_PACKAGE": config["argus_package"]})
     for role in ("ENGINEER", "REVIEWER", "PLANNER", "MANAGER", "LIGHT"):
         env[f"ARGUS_SKILL_{role}_MODEL"] = MODEL
     # How many of one tenant's projects may run at once (preview.json limits.daemons).
-    env["ARGUS_SKILL_MAX_ACTIVE_DAEMONS"] = str(int((config.get("limits") or {}).get("daemons", 1)))
+    env["ARGUS_SKILL_MAX_ACTIVE_DAEMONS"] = str(int((config.get("limits") or {}).get("daemons", 64)))
     for key, value in env.items():
         args.extend(("--setenv", key, value))
     args.extend(("--chdir", "/tenant/workspace", "--"))
@@ -79,82 +92,102 @@ async def inside():
     from argus.webapi.server import create_app
     from native_egress import bridge
 
-    resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
-    resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))
+    # No file size cap (wheels such as torch and model weights run to GBs);
+    # open files up to what the host grants. The workspace's total size is
+    # still watched from outside (StorageWatch).
+    resource.setrlimit(resource.RLIMIT_FSIZE, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+    hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+    files = 65536 if hard == resource.RLIM_INFINITY else min(65536, hard)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (files, files))
     model = await asyncio.start_server(lambda r, w: bridge(r, w, target_socket="/meter/model.sock"), "127.0.0.1", 9011)
     proxy = await asyncio.start_server(lambda r, w: bridge(r, w, target_socket="/meter/egress.sock"), "127.0.0.1", 9012)
     socket_path = Path("/tenant/run/web.sock")
     socket_path.unlink(missing_ok=True)
-    app = create_app(global_root="/tenant/state")
-    server = uvicorn.Server(uvicorn.Config(app, uds=str(socket_path), access_log=False, proxy_headers=False))
     async with model, proxy:
+        if package := os.environ.get("ARGUS_TRIAL_PACKAGE"):
+            await serve_js(Path(package), socket_path)
+            return
+        app = create_app(global_root="/tenant/state")
+        server = uvicorn.Server(uvicorn.Config(app, uds=str(socket_path), access_log=False, proxy_headers=False))
         await server.serve()
+
+
+async def serve_js(package: Path, socket_path: Path, port: int = 8799):
+    """The TypeScript Argus serves TCP inside the tenant's own network; the
+    portal reaches it through the same Unix socket a Python runtime listens on."""
+    async def pipe(reader, writer):
+        # No idle or size bound: page streams stay open while work runs.
+        try:
+            while chunk := await reader.read(65536):
+                writer.write(chunk)
+                await writer.drain()
+        except OSError:
+            pass
+        finally:
+            writer.close()
+
+    async def forward(reader, writer):
+        try:
+            other_reader, upstream = await asyncio.open_connection("127.0.0.1", port)
+        except OSError:
+            writer.close()
+            return
+        await asyncio.gather(pipe(reader, upstream), pipe(other_reader, writer))
+
+    # Each tenant runs one runtime, and this namespace is new: an owner left by
+    # the last one is stale. Its pid is often this child's own (pids restart
+    # at 1 per namespace), which Argus would read as "in use" and refuse.
+    (Path(os.environ["ARGUS_HOME"]) / "owner.json").unlink(missing_ok=True)
+    child = await asyncio.create_subprocess_exec(
+        "node", str(package / "dist/argus.mjs"), "--port", str(port), "--backend", "codex", "--model", MODEL)
+    web = await asyncio.start_unix_server(forward, str(socket_path))
+    async with web:
+        code = await child.wait()
+    raise SystemExit(code)
 
 
 class ResourceWatchdog:
     """Fallback for hosts without delegated cgroup resource controllers.
 
-    Account the entire sandbox process tree, including threads. Stop it on
-    memory/process excess or sustained CPU excess. Limits stay outside guests.
+    Account the entire sandbox process tree, including threads, and stop it
+    only on runaway memory or process counts (preview.json ``limits``
+    ``memory_gb`` and ``tasks``). CPU is never policed: busy work runs slower,
+    it is not cancelled.
     """
-    def __init__(self, pid: int, *, memory_bytes: int = 8 * 1024**3, tasks: int = 512, cpu_core: int | None = None):
+    def __init__(self, pid: int, *, memory_bytes: int = 128 * 1024**3, tasks: int = 65536):
         import psutil
 
         self.process = psutil.Process(pid)
         self.memory_limit = memory_bytes
         self.task_limit = tasks
-        self.cpu_core = cpu_core
         self.memory_bytes = self.threads = 0
-        self.last_cpu: dict[int, float] = {}
-        self.last_at = time.monotonic()
-        self.cpu_excess_since: float | None = None
 
     def exceeded(self) -> str:
         import psutil
 
         memory = threads = 0
-        cpu: dict[int, float] = {}
         try:
             processes = [self.process, *self.process.children(recursive=True)]
         except psutil.NoSuchProcess:
             return ""
         for process in processes:
             try:
-                if self.cpu_core is not None:
-                    for thread in process.threads():
-                        os.sched_setaffinity(thread.id, {self.cpu_core})
                 memory += process.memory_info().rss
                 threads += process.num_threads()
-                times = process.cpu_times()
-                cpu[process.pid] = times.user + times.system + times.children_user + times.children_system
-            except psutil.NoSuchProcess:
-                continue
-            except ProcessLookupError:
+            except (psutil.NoSuchProcess, ProcessLookupError):
                 continue
             except (PermissionError, psutil.AccessDenied):
                 return "resource inspection"
         self.memory_bytes, self.threads = memory, threads
-        now = time.monotonic()
-        elapsed = max(0.01, now - self.last_at)
-        used = sum(max(0, value - self.last_cpu.get(pid, value)) for pid, value in cpu.items()) / elapsed
-        self.last_cpu, self.last_at = cpu, now
         if memory > self.memory_limit:
             return "memory"
         if threads > self.task_limit:
             return "process/thread"
-        if self.cpu_core is not None:
-            return ""  # Kernel affinity enforces CPU capacity without cancelling ordinary work.
-        if used > 1.25:
-            self.cpu_excess_since = self.cpu_excess_since or now
-            if now - self.cpu_excess_since > 5:
-                return "CPU"
-        else:
-            self.cpu_excess_since = None
         return ""
 
 
 STORAGE_BYTES = 2 * 1024**3
-STORAGE_ENTRIES = 100000
+STORAGE_ENTRIES = 5_000_000  # a few unpacked datasets and environments, not a cap on ordinary work
 
 
 def storage_usage(directory: str | Path) -> tuple[int, int]:
@@ -304,19 +337,19 @@ def main():
         asyncio.run(inside())
     else:
         config = json.loads(args.config.read_text())
+        # The storage check imports Argus: take the source the tenants run, not
+        # an older copy installed in the venv, which made every launcher fail
+        # that import and leave its runtime unwatched.
+        if source := config.get("source"):
+            sys.path.insert(0, source)
         command = extra or None
         if command and command[0] == "--":
             command = command[1:]
-        core = None
-        before_exec = None
-        if args.mode == "launch":
-            # Tenants take cores in name order, so no two share one until all are taken.
-            cores = sorted(os.sched_getaffinity(0))
-            core = cores[sorted(config["tenants"]).index(args.tenant) % len(cores)]
-            before_exec = lambda: os.sched_setaffinity(0, {core})
-        with subprocess.Popen(sandbox_command(config, args.tenant, command), env={}, preexec_fn=before_exec) as child:
+        limits = config.get("limits") or {}
+        with subprocess.Popen(sandbox_command(config, args.tenant, command), env={}) as child:
             directory = config["tenants"][args.tenant]["directory"]
-            watchdog = ResourceWatchdog(child.pid, cpu_core=core)
+            watchdog = ResourceWatchdog(child.pid, memory_bytes=int(float(limits.get("memory_gb", 128)) * 1024**3),
+                                        tasks=int(limits.get("tasks", 65536)))
             storage = StorageWatch(directory, config.get("limits"))
             last_storage = 0.0
             while child.poll() is None:
