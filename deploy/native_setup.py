@@ -10,6 +10,8 @@ from pathlib import Path
 
 # Codex inside a tenant reaches only the metered endpoint its runtime bridges
 # to 127.0.0.1:9011, with that tenant's own token (ARGUS_METER_TOKEN).
+# requires_openai_auth = false tells Argus's readiness check not to run
+# `codex login status`; without it the team daemon refuses to start.
 CODEX_CONFIG = '''model = "gpt-6.1-sol"
 model_provider = "meter"
 web_search = "disabled"
@@ -20,6 +22,7 @@ name = "Argus trial meter"
 base_url = "http://127.0.0.1:9011/v1"
 env_key = "ARGUS_METER_TOKEN"
 wire_api = "responses"
+requires_openai_auth = false
 request_max_retries = 3
 stream_max_retries = 3
 '''
