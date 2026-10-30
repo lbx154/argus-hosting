@@ -1,0 +1,10 @@
+**
+!pyproject.toml
+!README.md
+!LICENSE
+!argus_hosting/
+!argus_hosting/**
+!argus_trial_server/
+!argus_trial_server/**
+**/__pycache__/
+**/*.pyc
