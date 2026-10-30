@@ -12,10 +12,10 @@ requires-python = ">=3.11"
 authors = [
   { name = "lbx154" },
 ]
-# Argus itself is not a declared dependency: the code here imports it only on
-# Windows (process supervision) and the tests expect an Argus checkout on
-# PYTHONPATH. See README.md.
 dependencies = [
+  "argus",
+  "cryptography>=41",
+  "httpx>=0.27,<1",
   "jsonschema>=4",
   "portalocker>=3",
 ]
@@ -29,13 +29,22 @@ dev = [
 
 [project.scripts]
 pr-gate = "argus_hosting.pr_gate.regression.cli:main"
+argus-trial-server = "argus_trial_server.admin:main"
+argus-compute = "argus_trial_server.compute_client:main"
+argus-trial = "argus_hosting.trial.__main__:main"
+
+[project.entry-points."argus.hosting"]
+trial = "argus_trial_server.hosting"
+
+[project.entry-points."argus.hosting.client"]
+trial = "argus_hosting.trial.hosting"
 
 [project.urls]
 Repository = "https://github.com/lbx154/argus-hosting"
 Argus = "https://github.com/lbx154/Argus"
 
 [tool.hatch.build.targets.wheel]
-packages = ["argus_hosting"]
+packages = ["argus_hosting", "argus_trial_server"]
 
 [tool.ruff]
 line-length = 100
@@ -47,10 +56,14 @@ select = ["F", "E", "I"]
 ignore = ["E501", "E402", "E731"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["argus_hosting"]
+known-first-party = ["argus_hosting", "argus_trial_server"]
 known-third-party = ["argus"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+markers = [
+  "integration: crosses local process, filesystem or API boundaries",
+  "e2e: exercises a complete workflow through a real entry point or toolchain",
+]
 filterwarnings = ["ignore::DeprecationWarning"]
