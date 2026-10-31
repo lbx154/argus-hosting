@@ -293,14 +293,17 @@ def run(config: dict, repo: Path, *, upstream: str = "upstream", fork: str = "or
             return
         for tenant, row in config["tenants"].items():
             try:
-                with directory(row["directory"]) as home, directory("state", home) as state, \
-                        directory("contributions", state) as offers:
-                    for filename, data, request in requests(offers):
-                        outcome = settle(tenant, state, filename.removesuffix(".json"), request)
-                        print(f"{tenant}/{filename}: {outcome}", flush=True)
-                        if not dry_run:
-                            answer(offers, filename, data, request, outcome)
-            except OSError:  # no contributions yet, or not a directory of the tenant's own
+                with directory(row["directory"]) as home, directory("state", home) as state:
+                    if not dry_run:  # contributions/ tells the tenant's Argus that its offers are answered here
+                        with suppress(FileExistsError):
+                            os.mkdir("contributions", 0o700, dir_fd=state)
+                    with directory("contributions", state) as offers:
+                        for filename, data, request in requests(offers):
+                            outcome = settle(tenant, state, filename.removesuffix(".json"), request)
+                            print(f"{tenant}/{filename}: {outcome}", flush=True)
+                            if not dry_run:
+                                answer(offers, filename, data, request, outcome)
+            except OSError:  # no state yet, or contributions/ is not a directory of the tenant's own
                 continue
 
 

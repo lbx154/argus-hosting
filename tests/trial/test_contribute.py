@@ -362,6 +362,21 @@ def test_a_dry_run_commits_but_pushes_opens_and_answers_nothing(site, capsys):
     site.assert_nothing_left_the_host(offer)
 
 
+def test_a_run_makes_contributions_so_the_tenants_argus_offers(site, tmp_path):
+    site.state().mkdir(parents=True, exist_ok=True)
+    site.run(dry_run=True)
+    assert not (site.state() / "contributions").exists()
+    site.run()
+    assert (site.state() / "contributions").is_dir() and site.calls() == []
+    # A link the tenant put there is not followed: nothing is made where it points.
+    (site.state() / "contributions").rmdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (site.state() / "contributions").symlink_to(elsewhere)
+    site.run()
+    assert list(elsewhere.iterdir()) == [] and site.calls() == []
+
+
 def test_one_run_at_a_time(site, capsys):
     site.skill({"SKILL.md": SKILL})
     offer = site.offer()
