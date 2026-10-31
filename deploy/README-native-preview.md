@@ -172,3 +172,18 @@ names with Secure, Path=/ and no Domain; only the new names are accepted.
 **Existing users of both versions must enter their invitation once again.**
 Their workspaces, invitations and balances remain intact. DNS, tunnel changes
 and production rollout are operator actions, separate from this source change.
+
+### Skills tenants offer to the store
+
+A JS root also runs `argus-NAME-contribute.timer`. Every 30 seconds
+`contribute.py` turns each tenant's offer of a team skill
+(`state/contributions/<name>.json`) into a pull request to
+Argus-AiTeam/argus-verticals, and writes its address, or why the offer was
+refused, back into that file. It runs as the operator, with the operator's gh
+login, from the clone `<root>/verticals`, whose working tree it resets on every
+offer: fork the store once (`gh repo fork Argus-AiTeam/argus-verticals
+--clone=false`), then `gh repo clone <you>/argus-verticals <root>/verticals`,
+which names the fork `origin` and the store `upstream`. Add `--dry-run` to the
+service's command to commit a waiting offer in the clone without pushing,
+opening or answering anything. A skill reaches the store only when its
+maintainers merge the pull request.

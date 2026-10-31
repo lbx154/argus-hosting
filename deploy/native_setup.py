@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import secrets
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -93,6 +94,12 @@ def install_services(config: dict, root: Path) -> None:
     }
     for name in config['tenants']:
         commands[prefix + name] = [python, str(source / 'deploy/native_runtime.py'), 'launch', '--config', str(root / 'preview.json'), '--tenant', name]
+    # Tenants' offers of their skills to the store become pull requests, every 30
+    # seconds, with this user's gh login, from the argus-verticals clone in verticals/.
+    job = prefix + 'contribute'
+    if config.get('runtime') == 'js':
+        commands[job] = [python, str(source / 'deploy/contribute.py'), 'run', '--config', str(root / 'preview.json'),
+                         '--repo', str(root / 'verticals'), '--gh', shutil.which('gh') or 'gh']
     for name, command in commands.items():
         # systemd command lines have their own quoting and percent expansion.
         executable = ' '.join(json.dumps(arg.replace('%', '%%')) for arg in command)
@@ -103,12 +110,14 @@ def install_services(config: dict, root: Path) -> None:
         memory = f"{limits.get('memory_gb', 128)}G" if tenant else '8G'
         cpu = f"{int(limits.get('cpus', 32)) * 100}%" if tenant else '800%'
         tasks = int(limits.get('tasks', 65536)) if tenant else 8192
+        # The contribute job runs to its end each time its timer fires; the rest come back when they fail.
+        kind = 'oneshot' if name == job else 'simple\nRestart=on-failure\nRestartSec=5'
         text = f'''[Unit]
 Description=Argus invitation preview {name}
 After=network-online.target
 StartLimitIntervalSec=0
 [Service]
-Type=simple
+Type={kind}
 WorkingDirectory={str(source).replace("%", "%%")}
 ExecStart={executable}
 Environment={json.dumps('PYTHONPATH=' + str(source))}
@@ -117,8 +126,6 @@ UMask=0077
 StandardOutput=append:{root / (name + '.log')}
 StandardError=append:{root / (name + '.log')}
 NoNewPrivileges=yes
-Restart=on-failure
-RestartSec=5
 MemoryMax={memory}
 CPUQuota={cpu}
 TasksMax={tasks}
@@ -130,8 +137,19 @@ WantedBy=default.target
         path = units / (name + '.service')
         path.write_text(text)
         path.chmod(0o600)
+    if job in commands:
+        (units / (job + '.timer')).write_text(f'''[Unit]
+Description=Argus invitation preview {job}, every 30 seconds
+[Timer]
+OnActiveSec=30
+OnUnitInactiveSec=30
+AccuracySec=1
+[Install]
+WantedBy=timers.target
+''')
     subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True)
-    subprocess.run(['systemctl', '--user', 'enable', '--now', *commands], check=True, capture_output=True)
+    subprocess.run(['systemctl', '--user', 'enable', '--now', *(name + '.timer' if name == job else name for name in commands)],
+                   check=True, capture_output=True)
 
 
 def main():
