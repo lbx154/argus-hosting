@@ -82,6 +82,13 @@ class Router:
 
     async def http(self, scope, receive, send):
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+        query = scope.get("query_string", b"").decode("latin-1")
+        # Over http a login can only fail (its cookie is Secure), after the invitation went out in
+        # clear. cf-visitor names the browser's scheme; x-forwarded-proto may name a later hop.
+        visitor = re.search(r'"scheme":\s*"(\w+)"', headers.get("cf-visitor", ""))
+        if (visitor[1] if visitor else headers.get("x-forwarded-proto")) == "http":
+            path = scope.get("raw_path", scope["path"].encode()).decode("latin-1")
+            return await redirect(send, f"https://{headers.get('host', '')}{path}" + ("?" + query if query else ""), 301)
         preview, tenant = preview_host(headers.get("host", ""), self.preview_domain)
         if preview:
             if tenant is None or "js" not in self.versions:
@@ -94,7 +101,6 @@ class Router:
         else:
             version, inner, known = self.place(scope, headers)
         named = known == "path"
-        query = scope.get("query_string", b"").decode("latin-1")
         navigation = headers.get("sec-fetch-mode") == "navigate" or (
             "sec-fetch-mode" not in headers and "text/html" in headers.get("accept", ""))
         if not preview and scope["path"] == "/" and known != "referer":
@@ -252,8 +258,8 @@ async def respond(send, status: int, body: bytes, kind: str):
     await send({"type": "http.response.body", "body": body})
 
 
-async def redirect(send, location: str):
-    await send({"type": "http.response.start", "status": 302,
+async def redirect(send, location: str, status: int = 302):
+    await send({"type": "http.response.start", "status": status,
                 "headers": encode([("location", location), ("content-length", "0"), ("cache-control", "no-store")])})
     await send({"type": "http.response.body", "body": b""})
 
@@ -268,7 +274,8 @@ def main():
     args = parser.parse_args()
     versions = {name: int(port) for name, _, port in (item.partition("=") for item in args.version)}
     uvicorn.run(Router(versions, args.user_usd, args.preview_domain), host="127.0.0.1", port=args.port, lifespan="off",
-                access_log=False, proxy_headers=False, ws_max_size=16 * 1024 * 1024)
+                access_log=False, proxy_headers=False, ws_max_size=16 * 1024 * 1024,
+                headers=[("strict-transport-security", "max-age=31536000")])  # browsers heed it over https only
 
 
 if __name__ == "__main__":
