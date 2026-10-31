@@ -100,6 +100,8 @@ class Router:
             version, inner, known = "js", scope.get("raw_path", scope["path"].encode()).decode("ascii"), "preview"
         else:
             version, inner, known = self.place(scope, headers)
+        # The portals' own pages, not a tenant's API answers and files (all under /api/) or previews.
+        own = not preview and not (inner or "").startswith("/api/")
         named = known == "path"
         navigation = headers.get("sec-fetch-mode") == "navigate" or (
             "sec-fetch-mode" not in headers and "text/html" in headers.get("accept", ""))
@@ -147,7 +149,7 @@ class Router:
                 out.append((key, value))
             if named and navigation:
                 out.append(("set-cookie", f"{LAST}={version}; Path=/; Max-Age=2592000; Secure; HttpOnly; SameSite=Lax"))
-            if not preview and response.headers.get("content-type", "").startswith("text/html") and response.status_code == 200:
+            if own and response.headers.get("content-type", "").startswith("text/html") and response.status_code == 200:
                 page = await response.aread()
                 page = inject(page, SHIM % json.dumps("/" + version))
                 out = [(k, v) for k, v in out if k != "content-length"] + [("content-length", str(len(page)))]
