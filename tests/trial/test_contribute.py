@@ -191,6 +191,71 @@ def test_asking_again_updates_the_open_pull_request(site):
     assert site.pushed("packs/lab-notes/SKILL.md").endswith("More.\n")
 
 
+def test_asking_again_while_a_run_submits_waits_for_the_next_run(site, monkeypatch):
+    folder = site.skill({"SKILL.md": SKILL})
+    offer = site.offer()
+    submit = contribute.submit
+
+    def asked_again_meanwhile(*args, **kwargs):
+        url = submit(*args, **kwargs)
+        (folder / "SKILL.md").write_text(SKILL.replace("1.2.0", "1.3.0"))
+        offer.with_suffix(".json.tmp").write_text(json.dumps({"name": "lab-notes", "version": "1.3.0", "requested_at": time.time()}))
+        offer.with_suffix(".json.tmp").rename(offer)
+        return url
+
+    monkeypatch.setattr(contribute, "submit", asked_again_meanwhile)
+    site.run()
+    assert "submitted_at" not in json.loads(offer.read_text())
+    assert [path.name for path in offer.parent.iterdir()] == ["lab-notes.json"]
+    monkeypatch.setattr(contribute, "submit", submit)
+    site.run()
+
+    answer = json.loads(offer.read_text())
+    assert answer["version"] == "1.3.0" and answer["url"] and "version: 1.3.0" in site.pushed("packs/lab-notes/SKILL.md")
+
+
+@pytest.mark.parametrize("asked", ["1e300", "Infinity", "NaN"])
+def test_a_request_from_the_future_is_answered_once(site, asked):
+    site.skill({"SKILL.md": SKILL})
+    offer = site.offer()
+    offer.write_text('{"name": "lab-notes", "version": "1.2.0", "requested_at": %s}' % asked)
+
+    site.run()
+    answered = offer.read_text()
+    site.run()
+
+    assert json.loads(answered)["url"] and offer.read_text() == answered
+    assert [call[:2] for call in site.calls()] == [["pr", "list"], ["pr", "create"]]
+
+
+def test_the_version_stays_out_of_the_title_and_body(site):
+    version = "1.2.0 @torvalds @github/security " + "x" * 300
+    site.skill({"SKILL.md": SKILL.replace("1.2.0", version)})
+    offer = site.offer()
+
+    site.run()
+
+    assert json.loads(offer.read_text())["url"]
+    created = site.calls()[-1]
+    for flag in ("--title", "--body"):
+        assert "@" not in created[created.index(flag) + 1]
+    assert version in git("--git-dir", str(site.fork), "log", "-1", "--format=%B", "contrib/trial1-lab-notes")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any folder")
+def test_a_folder_that_cannot_be_read_fails_the_offer_rather_than_leaving_it_out(site):
+    folder = site.skill({"SKILL.md": SKILL, "scripts/run.py": "print(1)\n"})
+    offer = site.offer()
+    (folder / "scripts").chmod(0)
+    try:
+        site.run()
+    finally:
+        (folder / "scripts").chmod(0o755)
+
+    assert json.loads(offer.read_text())["error"] == contribute.FAILED
+    site.assert_nothing_left_the_host(offer)
+
+
 @pytest.mark.parametrize("layout", ["folder", "file", "inner folder", "skills"])
 def test_a_link_never_carries_a_host_file_into_a_pull_request(site, layout):
     if layout == "folder":
@@ -292,7 +357,7 @@ def test_a_dry_run_commits_but_pushes_opens_and_answers_nothing(site, capsys):
 
     shown = capsys.readouterr().out
     assert "lbx154 <145820328+lbx154@users.noreply.github.com>" in shown and "packs/lab-notes/SKILL.md" in shown
-    assert git("log", "-1", "--format=%s", "contrib/trial1-lab-notes", cwd=site.clone).startswith("技能商店：lab-notes 1.2.0")
+    assert git("log", "-1", "--format=%s", "contrib/trial1-lab-notes", cwd=site.clone) == "技能商店：lab-notes（试用站 try-js 的 trial1）\n"
     assert offer.read_text() == request
     site.assert_nothing_left_the_host(offer)
 
@@ -327,7 +392,7 @@ def test_the_js_trial_runs_the_job_every_30_seconds(tmp_path, monkeypatch, runti
         assert not list(units.glob("argus-try-js-contribute.*")) and "argus-try-js-contribute.timer" not in calls[-1]
         return
     job = (units / "argus-try-js-contribute.service").read_text()
-    assert "Type=oneshot\n" in job and "Restart=" not in job
+    assert "Type=oneshot\nTimeoutStartSec=10min\n" in job and "Restart=" not in job
     assert f'"{tmp_path / "hosting/deploy/contribute.py"}" "run"' in job and f'"--repo" "{tmp_path / "root/verticals"}"' in job
     assert "OnUnitInactiveSec=30\n" in (units / "argus-try-js-contribute.timer").read_text()
     assert "argus-try-js-contribute.timer" in calls[-1] and "argus-try-js-contribute" not in calls[-1]

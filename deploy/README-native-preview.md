@@ -185,5 +185,6 @@ offer: fork the store once (`gh repo fork Argus-AiTeam/argus-verticals
 --clone=false`), then `gh repo clone <you>/argus-verticals <root>/verticals`,
 which names the fork `origin` and the store `upstream`. Add `--dry-run` to the
 service's command to commit a waiting offer in the clone without pushing,
-opening or answering anything. A skill reaches the store only when its
-maintainers merge the pull request.
+opening or answering anything. systemd stops a run still going after 10
+minutes, stuck on GitHub say; the next one answers what it left. A skill
+reaches the store only when its maintainers merge the pull request.

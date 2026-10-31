@@ -47,7 +47,9 @@ AUTHOR = ("-c", "user.name=lbx154", "-c", "user.email=145820328+lbx154@users.nor
 UNREADABLE = "贡献请求读不懂，请在页面上重新点“贡献到技能商店”。"
 TOO_BIG = "这个技能合计超过 8 MiB，商店收不下。"
 FAILED = "提交到技能商店时出了问题，稍后可以重试；详情记在托管日志里。"
-BODY = """试用站 {site} 的租户 {tenant} 里，Argus 团队自创了技能 `{name}`（版本 {version}），用户在页面上确认把它贡献到技能商店。
+# The title and body leave out the version, the tenant's own text: a mention in the body would
+# notify whoever it names, and an open pull request keeps its first title when asked again.
+BODY = """试用站 {site} 的租户 {tenant} 里，Argus 团队自创了技能 `{name}`，用户在页面上确认把它贡献到技能商店。
 
 这个 PR 只改 `packs/{name}/` 和由 `scripts/build_packs.py` 重新生成的 `packs/catalog.json`。提交前托管端已按商店规则检查过：有 SKILL.md 且写明 description，路径合规，合计不超过 8 MiB，不含试用站的邀请码和令牌，读文件时不跟随符号链接。
 
@@ -82,21 +84,30 @@ def number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def load(offers: int, filename: str) -> bytes:
+    """A request file's bytes; none when it cannot be read."""
+    try:
+        return read(filename, offers, REQUEST_LIMIT)
+    except (OSError, Rejected):
+        return b""
+
+
 def requests(offers: int):
-    """The requests in a tenant's contributions/ still to answer, by file name. A file
-    that is no request comes as {}, so that its answer settles it."""
+    """The requests in a tenant's contributions/ still to answer: file name, bytes and
+    request. A file that is no request comes as {}, so that its answer settles it; one
+    asked again at a time still to come waits for it, and so is answered once."""
     for filename in sorted(os.listdir(offers)):
         if not (filename.endswith(".json") and NAME.fullmatch(filename[:-5])):
             continue
+        data = load(offers, filename)
         try:
-            data = read(filename, offers, REQUEST_LIMIT)
             request = json.loads(data) if len(data) <= REQUEST_LIMIT else {}
-        except (OSError, ValueError, Rejected):
+        except ValueError:
             request = {}
         request = request if isinstance(request, dict) else {}
         asked, answered = request.get("requested_at"), request.get("submitted_at")
-        if answered is None or (number(asked) and number(answered) and asked > answered):
-            yield filename, request
+        if answered is None or (number(asked) and number(answered) and answered < asked <= time.time()):
+            yield filename, data, request
 
 
 def secrets_of(config: dict) -> set[bytes]:
@@ -129,9 +140,25 @@ def field(matter: str, key: str) -> str:
     return re.sub(r"^'(.*)'$", r"\1", said)
 
 
+def walk(fd: int, prefix: str = ""):
+    """(path, directory, name) of each file below the open directory ``fd`` that the store
+    would hold: like its catalog, none in __pycache__ and no .pyc. No directory is entered
+    through a link, and one that cannot be opened is an error, never a part left out."""
+    for entry in os.listdir(fd):
+        path, mode = prefix + entry, os.stat(entry, dir_fd=fd, follow_symlinks=False).st_mode
+        if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+            raise Rejected(f"{json.dumps(path, ensure_ascii=False)} 是链接或特殊文件，商店只收普通文件。")
+        if entry.startswith(".") or UNSAFE.search(entry):
+            raise Rejected(f"商店收不了 {json.dumps(path, ensure_ascii=False)}：路径的每一段都不能以点开头，也不能有 \\、: 或控制字符。")
+        if stat.S_ISREG(mode) and not entry.endswith(".pyc"):
+            yield path, fd, entry
+        elif stat.S_ISDIR(mode) and entry != "__pycache__":
+            with directory(entry, fd) as inner:
+                yield from walk(inner, path + "/")
+
+
 def folder(state: int, name: str) -> dict[str, bytes]:
-    """The team skill ``name`` as the store would hold it, file by file. Like the
-    store's catalog, it leaves out __pycache__ and .pyc files."""
+    """The team skill ``name`` as the store would hold it, file by file."""
     try:
         with directory("skills", state) as skills:
             top = os.open(name, DIRECTORY, dir_fd=skills)
@@ -139,24 +166,12 @@ def folder(state: int, name: str) -> dict[str, bytes]:
         raise Rejected(f"团队技能库里没有 {name} 这个文件夹（链接不算）。") from None
     files, total = {}, 0
     try:
-        # follow_symlinks=False: fwalk descends into no linked directory, even one swapped in meanwhile.
-        for root, dirs, names, fd in os.fwalk(".", dir_fd=top):
-            dirs[:] = [entry for entry in dirs if entry != "__pycache__"]
-            for entry in dirs + names:
-                mode = os.stat(entry, dir_fd=fd, follow_symlinks=False).st_mode
-                path = json.dumps(os.path.normpath(os.path.join(root, entry)), ensure_ascii=False)
-                if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
-                    raise Rejected(f"{path} 是链接或特殊文件，商店只收普通文件。")
-                if entry.startswith(".") or UNSAFE.search(entry):
-                    raise Rejected(f"商店收不了 {path}：路径的每一段都不能以点开头，也不能有 \\、: 或控制字符。")
-            for entry in names:
-                if entry.endswith(".pyc"):
-                    continue
-                data = read(entry, fd, LIMIT - total)
-                total += len(data)
-                if total > LIMIT:
-                    raise Rejected(TOO_BIG)
-                files[os.path.normpath(os.path.join(root, entry))] = data
+        for path, fd, entry in walk(top):
+            data = read(entry, fd, LIMIT - total)
+            total += len(data)
+            if total > LIMIT:
+                raise Rejected(TOO_BIG)
+            files[path] = data
     finally:
         os.close(top)
     return files
@@ -221,7 +236,7 @@ def submit(repo: Path, files: dict[str, bytes], *, tenant: str, name: str, versi
     git(repo, "add", "--all", "--force", "--", f"packs/{name}", "packs/catalog.json")
     if not git(repo, "diff", "--cached", "--name-only"):
         raise Rejected("商店里的这个技能已经和你的一模一样，没有要提交的改动。")
-    title = f"技能商店：{name} {version}（试用站 {site} 的 {tenant}）"
+    title = f"技能商店：{name}（试用站 {site} 的 {tenant}）"
     git(repo, *AUTHOR, "commit", "--quiet", "-m",
         f"{title}\n\n试用站 {site} 的租户 {tenant} 自创的技能 {name}，版本 {version}；用户在页面上确认贡献，由托管端提交。")
     if dry_run:
@@ -233,11 +248,12 @@ def submit(repo: Path, files: dict[str, bytes], *, tenant: str, name: str, versi
         if open_request["headRepositoryOwner"]["login"].lower() == ours.lower():
             return open_request["url"]
     return output(gh, "pr", "create", "--repo", store, "--base", "main", "--head", f"{ours}:{branch}", "--title", title,
-                  "--body", BODY.format(site=site, tenant=tenant, name=name, version=version), cwd=repo).strip().splitlines()[-1]
+                  "--body", BODY.format(site=site, tenant=tenant, name=name), cwd=repo).strip().splitlines()[-1]
 
 
-def answer(offers: int, filename: str, request: dict, outcome: dict) -> None:
-    """Write the outcome over the request, atomically and never through a link."""
+def answer(offers: int, filename: str, data: bytes, request: dict, outcome: dict) -> None:
+    """Write the outcome over the request, atomically and never through a link; but not
+    over a new request that took its place meanwhile: the next run answers that one."""
     kept = {key: value for key, value in request.items() if key not in ("url", "error", "submitted_at")}
     temporary = f".{filename}.tmp"
     with suppress(FileNotFoundError):
@@ -245,7 +261,10 @@ def answer(offers: int, filename: str, request: dict, outcome: dict) -> None:
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=offers)
     with open(fd, "w") as file:
         json.dump({**kept, **outcome, "submitted_at": time.time()}, file)
-    os.rename(temporary, filename, src_dir_fd=offers, dst_dir_fd=offers)
+    if load(offers, filename) == data:
+        os.rename(temporary, filename, src_dir_fd=offers, dst_dir_fd=offers)
+    else:
+        os.unlink(temporary, dir_fd=offers)
 
 
 def run(config: dict, repo: Path, *, upstream: str = "upstream", fork: str = "origin", gh: str = "gh",
@@ -276,11 +295,11 @@ def run(config: dict, repo: Path, *, upstream: str = "upstream", fork: str = "or
             try:
                 with directory(row["directory"]) as home, directory("state", home) as state, \
                         directory("contributions", state) as offers:
-                    for filename, request in requests(offers):
+                    for filename, data, request in requests(offers):
                         outcome = settle(tenant, state, filename.removesuffix(".json"), request)
                         print(f"{tenant}/{filename}: {outcome}", flush=True)
                         if not dry_run:
-                            answer(offers, filename, request, outcome)
+                            answer(offers, filename, data, request, outcome)
             except OSError:  # no contributions yet, or not a directory of the tenant's own
                 continue
 

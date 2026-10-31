@@ -110,8 +110,9 @@ def install_services(config: dict, root: Path) -> None:
         memory = f"{limits.get('memory_gb', 128)}G" if tenant else '8G'
         cpu = f"{int(limits.get('cpus', 32)) * 100}%" if tenant else '800%'
         tasks = int(limits.get('tasks', 65536)) if tenant else 8192
-        # The contribute job runs to its end each time its timer fires; the rest come back when they fail.
-        kind = 'oneshot' if name == job else 'simple\nRestart=on-failure\nRestartSec=5'
+        # The contribute job runs to its end each time its timer fires, or is stopped after 10 minutes,
+        # stuck on GitHub say, for the next to answer what it left; the rest come back when they fail.
+        kind = 'oneshot\nTimeoutStartSec=10min' if name == job else 'simple\nRestart=on-failure\nRestartSec=5'
         text = f'''[Unit]
 Description=Argus invitation preview {name}
 After=network-online.target
