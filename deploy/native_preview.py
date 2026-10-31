@@ -45,9 +45,9 @@ MICRO = 1_000_000
 # UTF-8 bytes (an upper bound on text tokens), framing and the requested output.
 INPUT_CEILING = 5.0 / MICRO
 OUTPUT_CEILING = 20.0 / MICRO
-# Only protects the meter's memory. Codex compacts a conversation long before
-# its requests get near this; a 2 MB cap here used to fail long tasks outright.
-MAX_BODY = 64 * 1024 * 1024
+# The model relay's own limit (copilot-codex-relay MAX_REQUEST_BYTES): it drops
+# a larger request unread, so it is refused here, before anything is reserved.
+MAX_BODY = 16 * 1024 * 1024
 DEFAULT_OUTPUT = 32768  # reserved for when a request names no output cap
 # A reservation holds money only while its call runs and settles at the real
 # cost, which for a long conversation is mostly cached input. Capping it keeps
@@ -340,14 +340,12 @@ def model_app(config: dict, ledger: Ledger) -> FastAPI:
         reservation = None
         client = None
         upstream = None
-        submitted = False
         handed_off = False
         try:
             reservation = ledger.reserve(tenant, min(MAX_RESERVATION, (len(raw) + 4096) * INPUT_CEILING
                                                      + (requested or DEFAULT_OUTPUT) * OUTPUT_CEILING))
             url, headers, charge = upstream_request(config)
             client = httpx.AsyncClient(timeout=httpx.Timeout(1800, connect=15), follow_redirects=False, trust_env=False)
-            submitted = True
             upstream = await client.send(client.build_request("POST", url,
                                                              headers=headers, json=payload), stream=True)
             if upstream.status_code != 200:
@@ -368,8 +366,8 @@ def model_app(config: dict, ledger: Ledger) -> FastAPI:
         finally:
             if not handed_off:
                 try:
-                    if reservation:
-                        ledger.settle(reservation, interrupted_cost(len(raw)) if submitted else 0)
+                    if reservation:  # no answer from upstream, so nothing it could bill
+                        ledger.settle(reservation, 0)
                 finally:
                     slots.release()
                     if upstream:
