@@ -141,3 +141,29 @@ named tunnel at the router, not at a portal. The router renames portal cookies p
 version and adds the prefix back to redirects and to pages' WebSocket and history
 calls; other absolute-path requests are placed by their Referer, else by the
 version the browser opened last.
+
+### JS project preview origins
+
+With a JS Argus release supporting origin templates in `--preview-url`, add
+`"preview_domain": "argusbot.cn"` to the JS root's private `preview.json` and
+pass `--preview-domain argusbot.cn` to `try_router.py`. The launcher supplies
+`https://js-<tenant>-*.argusbot.cn`; project identifiers contain only lowercase
+letters and digits. Tenant names must be lowercase DNS labels. Without the
+field, no preview argument is passed; Python runtime startup is unchanged.
+
+The operator must add a **proxied wildcard CNAME** `*.argusbot.cn` pointing to
+`<TUNNEL-ID>.cfargotunnel.com`. In the named tunnel configuration, keep the
+`try.argusbot.cn` ingress first, then add `hostname: '*.argusbot.cn'` with
+`service: http://127.0.0.1:18870` (the router), before the final catch-all rule.
+Do not override the incoming HTTP Host. Use one-level subdomains as above so
+the existing `*.argusbot.cn` certificate covers them.
+
+Deploy the router and portal changes together, prepare DNS/ingress and matching
+domain configuration, then restart JS tenants on the template-capable Argus
+release. Preview hosts accept only GET/HEAD, never receive portal credentials,
+and bypass portal pages and path rewriting. Unknown tenants return 404.
+Portal session cookies and the router's version cookie now use `__Host-`
+names with Secure, Path=/ and no Domain; only the new names are accepted.
+**Existing users of both versions must enter their invitation once again.**
+Their workspaces, invitations and balances remain intact. DNS, tunnel changes
+and production rollout are operator actions, separate from this source change.

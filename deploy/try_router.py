@@ -21,7 +21,14 @@ import uvicorn
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
 
-LAST = "argus_try_version"
+try:
+    from .preview_hosts import preview_domain as normalize_preview_domain
+    from .preview_hosts import preview_host
+except ImportError:  # Direct deployment script entry point.
+    from preview_hosts import preview_domain as normalize_preview_domain
+    from preview_hosts import preview_host
+
+LAST = "__Host-argus_try_version"
 HOP = {"connection", "keep-alive", "transfer-encoding", "upgrade", "te", "trailer", "proxy-connection",
        "accept-encoding", "cookie"}
 
@@ -60,8 +67,9 @@ for(const k of["pushState","replaceState"]){const f=history[k];history[k]=functi
 
 
 class Router:
-    def __init__(self, versions: dict[str, int], user_usd: float):
+    def __init__(self, versions: dict[str, int], user_usd: float, preview_domain: str | None = None):
         self.versions = versions
+        self.preview_domain = normalize_preview_domain(preview_domain)
         self.landing = LANDING.replace("{user}", f"{user_usd:g}").encode()
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10), trust_env=False,
                                         limits=httpx.Limits(max_connections=400, max_keepalive_connections=100))
@@ -78,13 +86,11 @@ class Router:
         return (last if last in self.versions else None), path, "last"
 
     def inward_cookies(self, headers: dict[str, str], version: str) -> str:
-        own = version + "__"
+        own = "__Host-" + version + "__"
         kept = []
         for name, value in cookies(headers).items():
             if name.startswith(own):
-                kept.append(f"{name[len(own):]}={value}")
-            elif name != LAST and not any(name.startswith(other + "__") for other in self.versions):
-                kept.append(f"{name}={value}")
+                kept.append(f"__Host-{name[len(own):]}={value}")
         return "; ".join(kept)
 
     async def __call__(self, scope, receive, send):
@@ -95,22 +101,33 @@ class Router:
 
     async def http(self, scope, receive, send):
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
-        version, inner, known = self.place(scope, headers)
+        preview, tenant = preview_host(headers.get("host", ""), self.preview_domain)
+        if preview:
+            if tenant is None or "js" not in self.versions:
+                return await respond(send, 404, b"", "text/plain")
+            if scope["method"] not in ("GET", "HEAD"):
+                await send({"type": "http.response.start", "status": 405,
+                            "headers": encode([("allow", "GET, HEAD"), ("content-length", "0")])})
+                return await send({"type": "http.response.body", "body": b""})
+            version, inner, known = "js", scope.get("raw_path", scope["path"].encode()).decode("ascii"), "preview"
+        else:
+            version, inner, known = self.place(scope, headers)
         named = known == "path"
         query = scope.get("query_string", b"").decode("latin-1")
         navigation = headers.get("sec-fetch-mode") == "navigate" or (
             "sec-fetch-mode" not in headers and "text/html" in headers.get("accept", ""))
-        if scope["path"] == "/" and known != "referer":
+        if not preview and scope["path"] == "/" and known != "referer":
             return await respond(send, 200, self.landing, "text/html; charset=utf-8")
         if version is None:
             return await respond(send, 404, NOT_FOUND.encode(), "text/html; charset=utf-8")
         if named and inner is None:
             return await redirect(send, f"/{version}/" + ("?" + query if query else ""))
-        if not named and navigation and scope["method"] in ("GET", "HEAD"):
+        if not preview and not named and navigation and scope["method"] in ("GET", "HEAD"):
             # Keep the address bar under the version's prefix; a form post is answered in place.
             return await redirect(send, f"/{version}{scope['path']}" + ("?" + query if query else ""))
-        upstream_headers = [(k, v) for k, v in headers.items() if k not in HOP]
-        if cookie := self.inward_cookies(headers, version):
+        upstream_headers = [(k, v) for k, v in headers.items() if k not in HOP and
+                            (not preview or k not in ("authorization", "proxy-authorization", "x-argus-public-host"))]
+        if not preview and (cookie := self.inward_cookies(headers, version)):
             upstream_headers.append(("cookie", cookie))
         upstream_headers.append(("accept-encoding", "identity"))
         has_body = "content-length" in headers or "transfer-encoding" in headers
@@ -136,14 +153,14 @@ class Router:
                 key = key.lower()
                 if key in ("transfer-encoding", "connection", "keep-alive"):
                     continue
-                if key == "location":
+                if key == "location" and not preview:
                     value = outward_location(value, version, headers.get("host", ""))
-                elif key == "set-cookie":
+                elif key == "set-cookie" and not preview:
                     value = outward_cookie(value, version)
                 out.append((key, value))
             if named and navigation:
                 out.append(("set-cookie", f"{LAST}={version}; Path=/; Max-Age=2592000; Secure; HttpOnly; SameSite=Lax"))
-            if response.headers.get("content-type", "").startswith("text/html") and response.status_code == 200:
+            if not preview and response.headers.get("content-type", "").startswith("text/html") and response.status_code == 200:
                 page = await response.aread()
                 page = inject(page, SHIM % json.dumps("/" + version))
                 out = [(k, v) for k, v in out if k != "content-length"] + [("content-length", str(len(page)))]
@@ -159,6 +176,9 @@ class Router:
 
     async def websocket(self, scope, receive, send):
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+        if preview_host(headers.get("host", ""), self.preview_domain)[0]:
+            await receive()
+            return await send({"type": "websocket.close", "code": 4404})
         version, inner, _known = self.place(scope, headers)
         await receive()  # websocket.connect
         if version is None or inner is None:
@@ -225,7 +245,13 @@ def outward_cookie(value: str, version: str) -> str:
     since a page under /py also requests absolute paths outside it."""
     first, *attributes = [part.strip() for part in value.split(";")]
     attributes = [part for part in attributes if not part.lower().startswith("path=")] + ["Path=/"]
-    return "; ".join([f"{version}__{first}", *attributes])
+    name, separator, content = first.partition("=")
+    if name.startswith("__Host-"):
+        name = name[len("__Host-"):]
+    attributes = [part for part in attributes if not part.lower().startswith("domain=")]
+    if not any(part.lower() == "secure" for part in attributes):
+        attributes.append("Secure")
+    return "; ".join([f"__Host-{version}__{name}{separator}{content}", *attributes])
 
 
 def inject(page: bytes, script: str) -> bytes:
@@ -257,9 +283,10 @@ def main():
     parser.add_argument("--version", action="append", required=True, metavar="NAME=PORT",
                         help="a path prefix and the loopback port of its portal, e.g. py=18871")
     parser.add_argument("--user-usd", type=float, default=50, help="the per-invitation allowance the landing page states")
+    parser.add_argument("--preview-domain", help="same preview_domain as the JS portal's preview.json")
     args = parser.parse_args()
     versions = {name: int(port) for name, _, port in (item.partition("=") for item in args.version)}
-    uvicorn.run(Router(versions, args.user_usd), host="127.0.0.1", port=args.port, lifespan="off",
+    uvicorn.run(Router(versions, args.user_usd, args.preview_domain), host="127.0.0.1", port=args.port, lifespan="off",
                 access_log=False, proxy_headers=False, ws_max_size=16 * 1024 * 1024)
 
 

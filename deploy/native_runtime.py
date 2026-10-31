@@ -15,6 +15,11 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    from .preview_hosts import preview_domain, preview_template
+except ImportError:  # Executed as deploy/native_runtime.py inside the namespace.
+    from preview_hosts import preview_domain, preview_template
+
 MODEL = "gpt-6.1-sol"
 
 
@@ -75,6 +80,8 @@ def sandbox_command(config: dict, tenant: str, command: list[str] | None = None)
     if config.get("runtime") == "js":
         env.update({"ARGUS_HOME": "/tenant/state", "ARGUS_WEB_TOKEN": row["web_token"],
                     "ARGUS_TRIAL_PACKAGE": config["argus_package"]})
+        if domain := preview_domain(config.get("preview_domain")):
+            env["ARGUS_TRIAL_PREVIEW_URL"] = preview_template(tenant, domain)
     for role in ("ENGINEER", "REVIEWER", "PLANNER", "MANAGER", "LIGHT"):
         env[f"ARGUS_SKILL_{role}_MODEL"] = MODEL
     # How many of one tenant's projects may run at once (preview.json limits.daemons).
@@ -138,8 +145,10 @@ async def serve_js(package: Path, socket_path: Path, port: int = 8799):
     # the last one is stale. Its pid is often this child's own (pids restart
     # at 1 per namespace), which Argus would read as "in use" and refuse.
     (Path(os.environ["ARGUS_HOME"]) / "owner.json").unlink(missing_ok=True)
-    child = await asyncio.create_subprocess_exec(
-        "node", str(package / "dist/argus.mjs"), "--port", str(port), "--backend", "codex", "--model", MODEL)
+    command = ["node", str(package / "dist/argus.mjs"), "--port", str(port), "--backend", "codex", "--model", MODEL]
+    if template := os.environ.get("ARGUS_TRIAL_PREVIEW_URL"):
+        command.extend(("--preview-url", template))
+    child = await asyncio.create_subprocess_exec(*command)
     web = await asyncio.start_unix_server(forward, str(socket_path))
     async with web:
         code = await child.wait()

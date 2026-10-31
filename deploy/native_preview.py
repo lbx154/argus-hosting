@@ -22,10 +22,21 @@ from urllib.parse import parse_qs, urlencode
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from websockets.legacy.client import unix_connect
 
-COOKIE = "argus_preview_session"
+try:
+    from .preview_hosts import preview_domain, preview_host, preview_template
+except ImportError:  # Direct deployment script entry point.
+    from preview_hosts import preview_domain, preview_host, preview_template
+
+COOKIE = "__Host-argus_preview_session"
 MODEL = "gpt-6.1-sol"
 MICRO = 1_000_000
 # Twice the authoritative rates observed from Copilot token_details for this
@@ -427,8 +438,70 @@ def unreachable_reason(row: dict) -> str:
             "请联系提供邀请码的人清理文件或增加空间，之后会自动接着做。")
 
 
+class PreviewHosts:
+    """Intercept preview hosts before any portal HTTP or WebSocket endpoint."""
+
+    def __init__(self, app, config: dict):
+        self.app = app
+        self.config = config
+        self.domain = preview_domain(config.get("preview_domain"))
+        if self.domain and config.get("runtime") == "js":
+            for tenant in config["tenants"]:
+                preview_template(tenant, self.domain)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+        headers = dict(scope["headers"])
+        reserved, tenant = preview_host(headers.get(b"host", b"").decode("latin-1"), self.domain)
+        if not reserved:
+            return await self.app(scope, receive, send)
+        if scope["type"] == "websocket":
+            await receive()
+            return await send({"type": "websocket.close", "code": 4404})
+        if self.config.get("runtime") != "js" or tenant not in self.config["tenants"]:
+            response = Response(status_code=404)
+        elif scope["method"] not in ("GET", "HEAD"):
+            response = Response(status_code=405, headers={"Allow": "GET, HEAD"})
+        else:
+            response = await self.forward(Request(scope, receive), self.config["tenants"][tenant])
+        await response(scope, receive, send)
+
+    async def forward(self, request: Request, row: dict):
+        # Allow only public file request headers; never relay browser credentials
+        # or the portal's metered/runtime/relay tokens to a preview origin.
+        headers = {k: v for k, v in request.headers.items() if k in (
+            "host", "origin", "accept", "accept-language", "range", "if-range",
+            "if-none-match", "if-modified-since", "user-agent")}
+        client = httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=row["socket"]),
+                                   timeout=httpx.Timeout(None, connect=10), trust_env=False)
+        path = request.scope.get("raw_path", request.url.path.encode()).decode("ascii")
+        query = request.scope.get("query_string", b"").decode("ascii")
+        try:
+            response = await client.send(client.build_request(request.method, "http://localhost" + path +
+                                                              ("?" + query if query else ""), headers=headers), stream=True)
+        except httpx.HTTPError:
+            await client.aclose()
+            return Response(status_code=503, headers={"Retry-After": "5"})
+        out = [(k.encode("latin-1"), v.encode("latin-1")) for k, v in response.headers.multi_items()
+               if k not in ("transfer-encoding", "connection", "keep-alive")]
+
+        async def chunks():
+            try:
+                async for chunk in response.aiter_raw():
+                    yield chunk
+            finally:
+                await response.aclose()
+                await client.aclose()
+
+        result = StreamingResponse(chunks(), status_code=response.status_code)
+        result.raw_headers = out
+        return result
+
+
 def portal_app(config: dict, ledger: Ledger) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(PreviewHosts, config=config)
     invites = {row["invite"]: name for name, row in config["tenants"].items()}
     login_html = (LOGIN.replace("{user}", f"{ledger.user / MICRO:g}").replace("{total}", f"{ledger.total / MICRO:g}")
                   .replace("Argus 6.1 试用", config.get("title", "Argus 6.1 试用")))
