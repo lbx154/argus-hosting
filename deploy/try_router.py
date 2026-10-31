@@ -102,6 +102,8 @@ class Router:
             version, inner, known = self.place(scope, headers)
         # The portals' own pages, not a tenant's API answers and files (all under /api/) or previews.
         own = not preview and not (inner or "").startswith("/api/")
+        if own:
+            send = framed(send)
         named = known == "path"
         navigation = headers.get("sec-fetch-mode") == "navigate" or (
             "sec-fetch-mode" not in headers and "text/html" in headers.get("accept", ""))
@@ -248,6 +250,15 @@ def inject(page: bytes, script: str) -> bytes:
     match = re.search(r"<head[^>]*>", text, re.I) or re.search(r"<html[^>]*>", text, re.I)
     at = match.end() if match else 0
     return (text[:at] + script + text[at:]).encode()
+
+
+def framed(send):
+    """Let no other site frame a page: a preview, though same-site, could clickjack a signed-in cockpit."""
+    async def framed_send(message):
+        if message["type"] == "http.response.start":
+            message = {**message, "headers": [*message["headers"], (b"content-security-policy", b"frame-ancestors 'self'")]}
+        await send(message)
+    return framed_send
 
 
 def encode(headers: list[tuple[str, str]]) -> list[tuple[bytes, bytes]]:
