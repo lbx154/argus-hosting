@@ -85,7 +85,8 @@ Still over, it restarts the runtime paused: the project page says the workspace 
 that files are kept, no project starts work, and the Manager still answers. Once usage is under
 90% of the limit the runtime restarts again and resumes the interrupted work. A paused
 workspace that grows another 25% stops until an operator cleans it up.
-Invitation sessions use signed, secure, HttpOnly cookies. HTTP mutations and
+Invitation sessions are random tokens in secure, HttpOnly cookies, kept as issued in
+the operator-only (0600) `sessions.sqlite3` beside the ledger. HTTP mutations and
 browser WebSockets check the browser origin. Runtime upgrades and provider /
 budget settings are operator-managed. Model credentials inside guests authorize
 only their own bounded balance.
