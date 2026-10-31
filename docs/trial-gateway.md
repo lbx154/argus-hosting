@@ -105,7 +105,7 @@ cd ~/argus-trial-gateway-20260909
 
 The command preserves the ten stable keys and balances. It prints only
 the export path: `~/.local/share/argus-trial-gateway/trial-keys.json` (0600),
-**outside the served directory**. The database stores credentials as issued, compares them in constant time, and retains historical claim records.
+**outside the served directory**. The database stores credentials as issued and compares them in constant time.
 Do not publish the operator export. The former browser recovery/claim endpoints
 are absent from the gateway even if an old static page remains on disk.
 
@@ -238,9 +238,9 @@ by the gateway. Encryption at rest does not protect against an operator who can
 read the master key or a compromised server process.
 
 Back up the database and encrypted credential consistently, with a separate
-protected master-key backup. Do not delete the ledger or casually rotate the
-master key: it also derives the ten stable trial keys. `init` preserves an
-existing key and rejects existing state whose master key is missing.
+protected master-key backup. Do not delete the ledger: it holds the ten stable
+trial keys and their balances. `init` preserves an existing key and rejects
+existing state whose master key is missing.
 
 Pre-launch rollback backup:
 `~/argus-trial-backups/key-launch-20260910` (old wheel, service, tunnel config,

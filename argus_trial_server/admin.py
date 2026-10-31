@@ -17,11 +17,11 @@ from .secrets import Vault, write_private
 from .store import TrialError
 
 
-def issue_keys(vault: Vault, state_dir: Path, output: Path, *, key_count: int = TRIAL_KEY_COUNT) -> dict[str, str]:
+def issue_keys(state_dir: Path, output: Path, *, key_count: int = TRIAL_KEY_COUNT) -> dict[str, str]:
     """Issue an explicitly sized pool; reruns retain the same keys and balances."""
     from .store import Store
 
-    store = Store(state_dir / "usage.sqlite3", key_limit=key_count, master_key=vault.key_path)
+    store = Store(state_dir / "usage.sqlite3", key_limit=key_count)
     keys = {f"trial-{i:02d}": store.issue(f"trial-{i:02d}") for i in range(1, key_count + 1)}
     write_private(output, json.dumps(
         [{"key_id": key_id, "api_key": credential} for key_id, credential in keys.items()], indent=2,
@@ -131,8 +131,7 @@ def main() -> int:
             args.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             print("Server master key initialized. Next run: argus-trial-server login")
         elif args.command == "issue-keys":
-            issue_keys(Vault(args.key_file, args.state_dir / "github-token.enc"), args.state_dir,
-                       args.keys_output or args.state_dir / "trial-keys.json", key_count=args.key_count)
+            issue_keys(args.state_dir, args.keys_output or args.state_dir / "trial-keys.json", key_count=args.key_count)
         elif args.command in {"login", "import-token", "import-copilot-login"}:
             vault = Vault(args.key_file, args.state_dir / "github-token.enc")
             if args.command == "login":

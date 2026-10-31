@@ -85,7 +85,8 @@ Still over, it restarts the runtime paused: the project page says the workspace 
 that files are kept, no project starts work, and the Manager still answers. Once usage is under
 90% of the limit the runtime restarts again and resumes the interrupted work. A paused
 workspace that grows another 25% stops until an operator cleans it up.
-Invitation sessions use signed, secure, HttpOnly cookies. HTTP mutations and
+Invitation sessions are random tokens in secure, HttpOnly cookies, kept as issued in
+the operator-only (0600) `sessions.sqlite3` beside the ledger. HTTP mutations and
 browser WebSockets check the browser origin. Runtime upgrades and provider /
 budget settings are operator-managed. Model credentials inside guests authorize
 only their own bounded balance.
@@ -148,8 +149,11 @@ With a JS Argus release supporting origin templates in `--preview-url`, add
 `"preview_domain": "argusbot.cn"` to the JS root's private `preview.json` and
 pass `--preview-domain argusbot.cn` to `try_router.py`. The launcher supplies
 `https://js-<tenant>-*.argusbot.cn`; project identifiers contain only lowercase
-letters and digits. Tenant names must be lowercase DNS labels. Without the
-field, no preview argument is passed; Python runtime startup is unchanged.
+letters and digits. Tenant names must be lowercase DNS labels of at most 27
+characters, so that `js-<tenant>-<32-digit project id>` fits one 63-byte DNS
+label; the portal, meter and launcher refuse a `preview.json` naming a longer one
+before anything starts. Without the field, no preview argument is passed; Python
+runtime startup is unchanged.
 
 The operator must add a **proxied wildcard CNAME** `*.argusbot.cn` pointing to
 `<TUNNEL-ID>.cfargotunnel.com`. In the named tunnel configuration, keep the

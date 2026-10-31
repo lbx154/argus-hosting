@@ -239,10 +239,10 @@ class TrainingData:
     def _initialize_review_receipts(self):
         """Persist only provenance and sizes; source bodies keep their own retention."""
         with self.analytics._db() as db:
-            # Receipts bound to a content digest cannot be checked any more; they
-            # lapse as if their samples had changed, and evidence keeps its size.
-            if "sample_sha256" in _columns(db, "training_sample_reviews"):
-                db.execute("DROP TABLE training_sample_reviews")
+            # Receipts older than size-bound samples cannot be checked any more;
+            # they lapse as if their samples had changed, and evidence keeps its size.
+            if "sample_bytes" not in _columns(db, "training_sample_reviews"):
+                db.execute("DROP TABLE IF EXISTS training_sample_reviews")
             if "evidence_bytes" not in _columns(db, "training_review_evidence"):
                 db.execute("ALTER TABLE training_review_evidence ADD COLUMN evidence_bytes INTEGER")
             db.executescript("""

@@ -110,7 +110,7 @@ def main() -> None:
         args.uds.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         from .store import Store
 
-        api_key = Store(settings.state_dir / "usage.sqlite3", master_key=settings.key_file).credential(args.tenant)
+        api_key = Store(settings.state_dir / "usage.sqlite3").credential(args.tenant)
         configure_provider(root, args.pi_bin.resolve(strict=True), vault, tenant=args.tenant, api_key=api_key,
                            model_port=args.model_port, training_socket=args.uds.parent / "training.sock")
         from argus.webapi.server import create_app

@@ -63,6 +63,8 @@ def sandbox_command(config: dict, tenant: str, command: list[str] | None = None)
         "HTTP_PROXY": "http://127.0.0.1:9012", "HTTPS_PROXY": "http://127.0.0.1:9012",
         "http_proxy": "http://127.0.0.1:9012", "https_proxy": "http://127.0.0.1:9012",
         "NO_PROXY": "localhost,127.0.0.1", "no_proxy": "localhost,127.0.0.1",
+        # Node 22's built-in fetch ignores the variables above unless told to read them.
+        "NODE_USE_ENV_PROXY": "1",
     }
     if config.get("agent") == "codex":
         env.update({"ARGUS_SKILL_RUNNER_BACKEND": "codex", "ARGUS_SKILL_RUNNER_BIN": "/tenant/bin/codex",

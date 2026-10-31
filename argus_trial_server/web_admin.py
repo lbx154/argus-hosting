@@ -13,7 +13,7 @@ from pathlib import Path
 from . import DEFAULT_UPSTREAM_MODEL
 from .admin import issue_keys
 from .hosted_host import require_no_follow_directories, require_posix_accounts
-from .secrets import Vault, write_private
+from .secrets import write_private
 
 DEFAULT_WEB_IMAGE = "argus-web-trial:pi-data-20260911-r6"
 
@@ -33,8 +33,7 @@ def initialize(root: Path, admin_token_file: Path, admin_url: str, *,
         if (root / "meter/usage.sqlite3").exists():
             raise ValueError("Restore the missing master key; existing allowances must not be reset")
         write_private(master, Fernet.generate_key())
-    vault = Vault(master, root / "meter/github-token.enc")
-    credentials = issue_keys(vault, root / "meter", root / "invitations.json")
+    credentials = issue_keys(root / "meter", root / "invitations.json")
     admin_access = root / "admin-access.json"
     if not admin_access.exists():
         write_private(admin_access, json.dumps({

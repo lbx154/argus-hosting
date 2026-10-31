@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-import hashlib
 import json
 import math
 import re
@@ -250,6 +249,9 @@ def load_config(path: Path) -> dict:
     value = json.loads(path.read_text())
     if value.get("model") != MODEL or not value.get("tenants"):
         raise ValueError("Preview requires gpt-6.1-sol and configured tenants")
+    if value.get("runtime") == "js" and (domain := preview_domain(value.get("preview_domain"))):
+        for tenant in value["tenants"]:
+            preview_template(tenant, domain)
     return value
 
 
@@ -441,9 +443,6 @@ class PreviewHosts:
         self.app = app
         self.config = config
         self.domain = preview_domain(config.get("preview_domain"))
-        if self.domain and config.get("runtime") == "js":
-            for tenant in config["tenants"]:
-                preview_template(tenant, self.domain)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] not in ("http", "websocket"):
@@ -503,34 +502,33 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
         return entry_page(ledger.user / MICRO, runtime=config.get("runtime", "py"),
                           title=config.get("title"), invite=invite, error=error)
 
-    # A session is a random token the portal holds, not a signed claim. Only
-    # its hash is kept, next to the ledger, so a portal restart (every deploy)
-    # does not sign everyone out and the file cannot be replayed as a cookie.
+    # A session is a random token the portal holds, not a signed claim. It is
+    # kept as issued next to the ledger so a portal restart (every deploy) does
+    # not sign everyone out. Whoever can read this file (0600, the operator)
+    # can sign in as any of its tenants.
     sessions_path = Path(config.get("sessions") or ledger.path.with_name("sessions.sqlite3"))
     with closing(sqlite3.connect(sessions_path)) as db:
-        db.execute("CREATE TABLE IF NOT EXISTS sessions (digest TEXT PRIMARY KEY, tenant TEXT NOT NULL, expiry REAL NOT NULL)")
-        db.commit()
+        db.executescript("""
+            DROP TABLE IF EXISTS sessions;  -- hashed sessions of earlier releases
+            CREATE TABLE IF NOT EXISTS logins (token TEXT PRIMARY KEY, tenant TEXT NOT NULL, expiry REAL NOT NULL);
+        """)
     sessions_path.chmod(0o600)
-
-    def digest(token: str) -> str:
-        return hashlib.sha256(token.encode()).hexdigest()
 
     def session(tenant: str) -> str:
         now = time.time()
         token = secrets.token_urlsafe(32)
         with closing(sqlite3.connect(sessions_path, timeout=10)) as db:
-            db.execute("DELETE FROM sessions WHERE expiry <= ?", (now,))
-            db.execute("INSERT INTO sessions VALUES (?,?,?)", (digest(token), tenant, now + 7 * 86400))
+            db.execute("DELETE FROM logins WHERE expiry <= ?", (now,))
+            db.execute("INSERT INTO logins VALUES (?,?,?)", (token, tenant, now + 7 * 86400))
             db.commit()
         return token
 
     def identify(cookie: str) -> str | None:
-        if not cookie:
-            return None
         with closing(sqlite3.connect(sessions_path, timeout=10)) as db:
-            row = db.execute("SELECT tenant, expiry FROM sessions WHERE digest=?", (digest(cookie),)).fetchone()
-        tenant, expiry = row or (None, 0.0)
-        return tenant if tenant in config["tenants"] and expiry > time.time() else None
+            rows = db.execute("SELECT token, tenant FROM logins WHERE expiry > ?", (time.time(),)).fetchall()
+        offered = cookie.encode()
+        tenant = next((tenant for token, tenant in rows if secrets.compare_digest(token.encode(), offered)), None)
+        return tenant if tenant in config["tenants"] else None
 
     def origin_ok(request: Request) -> bool:
         origin = request.headers.get("origin")

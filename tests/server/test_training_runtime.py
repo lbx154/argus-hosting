@@ -62,7 +62,7 @@ def verifier(peer, *, producer=False, parent=None):
         raise AnalyticsError(403, "training_peer_parent_mismatch")
     if not producer and peer[0] != 10:
         raise AnalyticsError(403, "training_runtime_parent_untrusted")
-    return {"pid": peer[0], "started": "real-start-tick", "source_sha256": {"test_fixture": "a" * 64}}
+    return {"pid": peer[0], "started": "real-start-tick"}
 
 
 def test_bridge_binds_parent_producer_and_episode_and_reports_failures(training):
@@ -85,7 +85,6 @@ def test_bridge_binds_parent_producer_and_episode_and_reports_failures(training)
     metadata = json.loads(row["runtime_metadata"])
     assert metadata["mission_id"] == "task-real" and len(metadata["capture_id"]) == 32
     assert metadata["capture_policy"] == "retain-observed-v2"
-    assert "source_sha256" not in metadata and "launch_sha256" not in metadata
     status = bridge.status()
     assert status["counts"]["registered"] == status["counts"]["registration_failed"] == 1
     assert status["counts"]["producer_verification_failed"] == 1
@@ -483,7 +482,6 @@ def test_real_pi_cli_actual_provider_payload_and_bash_receipts(training, tmp_pat
             assert metadata["run_label"] == "planner-preview"
         elif launch_mode == "planner_read_only":
             assert metadata["run_label"] == "planner.cycle0"
-        assert "source_sha256" not in metadata
     finally:
         server.shutdown()
         server.server_close()

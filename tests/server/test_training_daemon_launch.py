@@ -6,7 +6,6 @@ binding, ticket consumption, daemon hooks and persistent registration are real.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import socketserver
@@ -38,7 +37,7 @@ class _LocalImageVerifier(PeerVerifier):
     def _image_identity(self, proc, uid):
         # Test processes live outside the production container and their source
         # files are owned by the test user. Keep every OS lineage check intact.
-        return {"isolated_test_source": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+        return {}
 
 
 class _WebEndpoint(socketserver.BaseRequestHandler):

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
+import stat
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 
 import httpx
@@ -26,8 +29,8 @@ from deploy.native_runtime import sandbox_command
 
 @pytest.fixture
 def config(tmp_path):
-    return {'model': MODEL, 'revision': 'test-sha', 'session_secret': 'private-session-key',
-            'relay_secret': 'private-relay-key', 'copilot_home': str(tmp_path / 'not-logged-in'),
+    return {'model': MODEL, 'revision': 'test-sha', 'relay_secret': 'private-relay-key',
+            'copilot_home': str(tmp_path / 'not-logged-in'),
             'tenants': {'alice': {'invite': 'invite-a', 'model_token': 'meter-a', 'web_token': 'web-a', 'socket': str(tmp_path / 'a.sock')},
                         'bob': {'invite': 'invite-b', 'model_token': 'meter-b', 'web_token': 'web-b', 'socket': str(tmp_path / 'b.sock')}}}
 
@@ -160,6 +163,7 @@ def test_sandbox_has_no_host_network_home_or_cross_tenant_mount(config, tmp_path
     config['tenants']['alice']['directory'] = str(tmp_path / 'alice')
     command = sandbox_command(config, 'alice', ['/bin/true'])
     assert '--unshare-all' in command and '--share-net' not in command
+    assert command[command.index('NODE_USE_ENV_PROXY') + 1] == '1'  # Node's fetch takes the egress proxy too
     assert '--proc' in command and '--cap-drop' in command
     assert str(tmp_path / 'alice') in command and str(tmp_path / 'bob') not in command
     assert str(Path.home()) not in command
@@ -611,6 +615,9 @@ def test_meter_forwards_a_subagent_request_with_hosted_tools_to_a_priced_upstrea
 
 
 def test_a_portal_restart_keeps_signed_in_sessions(config, ledger):
+    stored = ledger.path.with_name('sessions.sqlite3')
+    with closing(sqlite3.connect(stored)) as db:  # the former table of hashed sessions
+        db.execute('CREATE TABLE sessions (digest TEXT PRIMARY KEY, tenant TEXT NOT NULL, expiry REAL NOT NULL)')
     first = TestClient(portal_app(config, ledger), base_url='https://preview.example')
     first.post('/login', data={'invite': 'invite-a'}, headers={'Origin': 'https://preview.example'}, follow_redirects=False)
     cookie = first.cookies.get(COOKIE)
@@ -618,8 +625,11 @@ def test_a_portal_restart_keeps_signed_in_sessions(config, ledger):
     restarted = TestClient(portal_app(config, ledger), base_url='https://preview.example')
     restarted.cookies.set(COOKIE, cookie)
     assert restarted.get('/trial/budget').status_code == 200
-    stored = (ledger.path.with_name('sessions.sqlite3')).read_bytes()
-    assert cookie.encode() not in stored  # only a hash is kept
+    restarted.cookies.set(COOKIE, cookie[:-1] + ('A' if cookie[-1] != 'A' else 'B'))
+    assert restarted.get('/trial/budget').status_code == 401
+    assert stat.S_IMODE(stored.stat().st_mode) == 0o600
+    with closing(sqlite3.connect(stored)) as db:
+        assert [name for (name,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'")] == ['logins']
 
 
 def test_a_signed_out_page_returns_to_the_login(config, ledger):

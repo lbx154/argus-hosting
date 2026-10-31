@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from argus_trial_server.admin import issue_keys
 from argus_trial_server.gateway import Settings, create_app
-from argus_trial_server.secrets import Vault, write_private
+from argus_trial_server.secrets import write_private
 from argus_trial_server.store import Store
 
 
@@ -15,17 +15,16 @@ from argus_trial_server.store import Store
 def pool(tmp_path):
     key = tmp_path / "master.key"
     write_private(key, Fernet.generate_key())
-    vault = Vault(key, tmp_path / "github-token.enc")
-    issue_keys(vault, tmp_path, tmp_path / "operator-keys.json")
-    return Settings(tmp_path, key), vault, Store(tmp_path / "usage.sqlite3")
+    issue_keys(tmp_path, tmp_path / "operator-keys.json")
+    return Settings(tmp_path, key), Store(tmp_path / "usage.sqlite3")
 
 
 def test_fixed_ten_keys_and_rerun_preserves_usage(pool, tmp_path):
-    settings, vault, store = pool
+    _, store = pool
     record = store.reserve("trial-01", 100)
     store.settle(record, 30)
     exported = (tmp_path / "operator-keys.json").read_bytes()
-    issue_keys(vault, tmp_path, tmp_path / "operator-keys.json")
+    issue_keys(tmp_path, tmp_path / "operator-keys.json")
     assert (tmp_path / "operator-keys.json").read_bytes() == exported
     assert store.status("trial-01")["tokens_used"] == 30
     keys = json.loads(exported)
@@ -38,26 +37,25 @@ def test_fixed_ten_keys_and_rerun_preserves_usage(pool, tmp_path):
 
 
 def test_explicit_eleventh_key_keeps_first_ten_credentials_balances_and_normal_auth(pool, tmp_path):
-    _, vault, store = pool
+    _, store = pool
     original = json.loads((tmp_path / "operator-keys.json").read_text())
     request = store.reserve("trial-01", 100)
     store.settle(request, 37)
-    issue_keys(vault, tmp_path, tmp_path / "operator-keys.json", key_count=11)
+    issue_keys(tmp_path, tmp_path / "operator-keys.json", key_count=11)
     expanded = json.loads((tmp_path / "operator-keys.json").read_text())
     assert expanded[:10] == original and expanded[10]["key_id"] == "trial-11"
     assert store.authenticate(expanded[10]["api_key"]) == "trial-11"
     assert store.status("trial-01")["tokens_used"] == 37
     assert store.status("trial-11")["tokens_used"] == 0
-    assert store.availability()["total_keys"] == store.availability()["issued_keys"] == 11
     before = (tmp_path / "operator-keys.json").read_bytes()
-    issue_keys(vault, tmp_path, tmp_path / "operator-keys.json", key_count=11)
+    issue_keys(tmp_path, tmp_path / "operator-keys.json", key_count=11)
     assert (tmp_path / "operator-keys.json").read_bytes() == before
     with pytest.raises(ValueError, match="11 trial keys"):
         Store(store.path, key_limit=11).issue("trial-12")
 
 
 def test_public_claim_and_recovery_are_removed_but_private_keys_work(pool):
-    settings, vault, store = pool
+    settings, store = pool
     key = store.credential("trial-01")
     record = store.reserve("trial-01", 100)
     store.settle(record, 30)
@@ -76,7 +74,7 @@ def test_public_claim_and_recovery_are_removed_but_private_keys_work(pool):
 
 
 def test_old_machine_credential_is_not_accepted(pool):
-    settings, vault, _store = pool
+    settings, _ = pool
     with TestClient(create_app(settings)) as client:
         old = "argus_trial_" + "a" * 64
         assert client.get("/trial/status", headers={"Authorization": "Bearer " + old}).status_code == 401
@@ -85,7 +83,7 @@ def test_old_machine_credential_is_not_accepted(pool):
 def test_only_downloads_are_public_even_if_old_pages_remain_on_disk(pool, tmp_path):
     from dataclasses import replace
 
-    settings, vault, store = pool
+    settings, store = pool
     site = tmp_path / "site"
     for folder in ("trial", "zh/trial", "trial/downloads"):
         path = site / folder
@@ -102,3 +100,15 @@ def test_only_downloads_are_public_even_if_old_pages_remain_on_disk(pool, tmp_pa
         assert response.headers["cache-control"] == "no-store"
         auth = {"Authorization": "Bearer " + store.credential("trial-01")}
         assert client.get("/trial/status", headers=auth).status_code == 200
+
+
+def test_sessions_are_random_server_records(tmp_path):
+    store = Store(tmp_path / "usage.sqlite3")
+    token = store.open_session({"tenant": "trial-01", "role": "trial"}, store.clock() + 60)
+    assert store.session(token) == {"tenant": "trial-01", "role": "trial"}
+    assert store.session(token[:-1] + ("A" if token[-1] != "A" else "B")) is None
+    assert store.open_session({}, store.clock() + 60) != token
+    store.close_session(token)
+    assert store.session(token) is None
+    expired = store.open_session({"tenant": "trial-01"}, store.clock() - 1)
+    assert store.session(expired) is None
