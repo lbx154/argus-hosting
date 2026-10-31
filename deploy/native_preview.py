@@ -33,8 +33,10 @@ from websockets.legacy.client import unix_connect
 
 try:
     from .preview_hosts import preview_domain, preview_host, preview_template
+    from .trial_pages import entry_page
 except ImportError:  # Direct deployment script entry point.
     from preview_hosts import preview_domain, preview_host, preview_template
+    from trial_pages import entry_page
 
 COOKIE = "__Host-argus_preview_session"
 MODEL = "gpt-6.1-sol"
@@ -415,12 +417,6 @@ def model_app(config: dict, ledger: Ledger) -> FastAPI:
     return app
 
 
-LOGIN = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Argus 6.1 试用</title><style>body{font:16px system-ui;background:#f6f7f9;color:#172333;margin:0}main{max-width:420px;margin:12vh auto;padding:32px;background:white;border:1px solid #ddd;border-radius:18px}input,button{box-sizing:border-box;width:100%;padding:13px;font:inherit;border-radius:9px;margin:10px 0;border:1px solid #ddd}button{background:#2069d1;color:white;border:0}p{line-height:1.7;color:#536071}</style>
-<main><h1>Argus 6.1 试用</h1><p>告诉它需要做什么，它会实际查资料、写代码和验证结果。</p><p>每个邀请码有独立的工作区和 {user} 美元额度。全站总额度为 {total} 美元，用完后暂停；额度不会自动重置。</p>
-<form method="post" action="/login"><label>邀请码</label><input name="invite" autocomplete="off" required placeholder="粘贴你的邀请码"><button>进入试用</button></form></main></html>"""
-
-
 RECOVERING = """<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="5">
 <title>工作区暂时不可用 · Argus</title><style>body{font:16px system-ui;background:#f6f7f9;color:#172333;margin:0}main{max-width:440px;margin:12vh auto;padding:32px;background:white;border-radius:18px}p{line-height:1.7;color:#536071}a{color:#2069d1}</style>
@@ -503,8 +499,10 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(PreviewHosts, config=config)
     invites = {row["invite"]: name for name, row in config["tenants"].items()}
-    login_html = (LOGIN.replace("{user}", f"{ledger.user / MICRO:g}").replace("{total}", f"{ledger.total / MICRO:g}")
-                  .replace("Argus 6.1 试用", config.get("title", "Argus 6.1 试用")))
+    def login_html(*, invite: str = "", error: bool = False) -> str:
+        return entry_page(ledger.user / MICRO, runtime=config.get("runtime", "py"),
+                          title=config.get("title"), invite=invite, error=error)
+
     # A session is a random token the portal holds, not a signed claim. Only
     # its hash is kept, next to the ledger, so a portal restart (every deploy)
     # does not sign everyone out and the file cannot be replayed as a cookie.
@@ -545,7 +543,7 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
 
     @app.get("/login")
     async def login_page():
-        return HTMLResponse(login_html, headers={"Cache-Control": "no-store"})
+        return HTMLResponse(login_html(), headers={"Cache-Control": "no-store"})
 
     @app.post("/login")
     async def login(request: Request):
@@ -558,7 +556,7 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
             return JSONResponse({"detail": "邀请码格式不正确。"}, 400)
         tenant = next((name for invite, name in invites.items() if secrets.compare_digest(token, invite)), None)
         if tenant is None:
-            return HTMLResponse(login_html.replace("<h1>", "<p>邀请码不正确，请检查后重试。</p><h1>"), 401)
+            return HTMLResponse(login_html(invite=token, error=True), 401, headers={"Cache-Control": "no-store"})
         response = RedirectResponse("/", 303)
         response.set_cookie(COOKIE, session(tenant), secure=True, httponly=True, samesite="lax", max_age=7 * 86400)
         return response

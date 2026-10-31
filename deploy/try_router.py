@@ -24,34 +24,15 @@ from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidSta
 try:
     from .preview_hosts import preview_domain as normalize_preview_domain
     from .preview_hosts import preview_host
+    from .trial_pages import entry_page
 except ImportError:  # Direct deployment script entry point.
     from preview_hosts import preview_domain as normalize_preview_domain
     from preview_hosts import preview_host
+    from trial_pages import entry_page
 
 LAST = "__Host-argus_try_version"
 HOP = {"connection", "keep-alive", "transfer-encoding", "upgrade", "te", "trailer", "proxy-connection",
        "accept-encoding", "cookie"}
-
-LANDING = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Argus 试用</title>
-<style>
-:root{--bg:#fbfbfa;--card:#fff;--ink:#141414;--dim:#6b6b6b;--line:#d9d9d6;--gold:#a8842c}
-@media (prefers-color-scheme:dark){:root{--bg:#121212;--card:#1b1b1b;--ink:#f1f1ef;--dim:#9a9a96;--line:#333331;--gold:#d2ad55}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.7 system-ui,-apple-system,"PingFang SC","Noto Sans SC",sans-serif}
-main{max-width:720px;margin:0 auto;padding:12vh 16px 64px}h1{font-size:30px;font-weight:600;letter-spacing:.01em;margin:0 0 8px}
-p{color:var(--dim);margin:0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:40px 0 28px}
-a.card{display:block;padding:24px;background:var(--card);border:1px solid var(--line);border-radius:14px;color:inherit;text-decoration:none;transition:border-color .15s}
-a.card:hover,a.card:focus-visible{border-color:var(--gold);outline:none}a.card b{display:block;font-size:19px;font-weight:600;margin-bottom:6px}
-a.card span{display:block;margin-top:18px;color:var(--gold);font-size:14px}small{color:var(--dim);font-size:13px}
-@media (max-width:560px){.grid{grid-template-columns:1fr}}
-</style></head><body><main>
-<h1>Argus 试用</h1><p>告诉它要做什么，它会查资料、写代码，并把结果验证给你看。</p>
-<div class="grid">
-<a class="card" href="/py/"><b>Python 版</b><p>现行版本，功能最全。</p><span>进入 →</span></a>
-<a class="card" href="/js/"><b>JS 版</b><p>新的 TypeScript 核心，更轻、更快。</p><span>进入 →</span></a>
-</div>
-<small>邀请码只能在发给你的那个版本使用。每个码有独立的工作区和 {user} 美元额度，用完即止，不会重置。</small>
-</main></body></html>"""
 
 NOT_FOUND = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>找不到页面 · Argus 试用</title><body style="font:16px/1.7 system-ui;margin:12vh auto;max-width:420px;padding:0 16px">
@@ -70,7 +51,7 @@ class Router:
     def __init__(self, versions: dict[str, int], user_usd: float, preview_domain: str | None = None):
         self.versions = versions
         self.preview_domain = normalize_preview_domain(preview_domain)
-        self.landing = LANDING.replace("{user}", f"{user_usd:g}").encode()
+        self.landing = entry_page(user_usd).encode()
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10), trust_env=False,
                                         limits=httpx.Limits(max_connections=400, max_keepalive_connections=100))
 
