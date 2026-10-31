@@ -249,6 +249,9 @@ def load_config(path: Path) -> dict:
     value = json.loads(path.read_text())
     if value.get("model") != MODEL or not value.get("tenants"):
         raise ValueError("Preview requires gpt-6.1-sol and configured tenants")
+    if value.get("runtime") == "js" and (domain := preview_domain(value.get("preview_domain"))):
+        for tenant in value["tenants"]:
+            preview_template(tenant, domain)
     return value
 
 
@@ -440,9 +443,6 @@ class PreviewHosts:
         self.app = app
         self.config = config
         self.domain = preview_domain(config.get("preview_domain"))
-        if self.domain and config.get("runtime") == "js":
-            for tenant in config["tenants"]:
-                preview_template(tenant, self.domain)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] not in ("http", "websocket"):

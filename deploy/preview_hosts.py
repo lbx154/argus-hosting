@@ -16,9 +16,11 @@ def preview_domain(value: str | None) -> str:
 
 
 def preview_template(tenant: str, domain: str) -> str:
-    # Leave room for at least one project identifier in the 63-byte DNS label.
-    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", tenant) or len(tenant) > 58:
-        raise ValueError("preview tenant must be a lowercase DNS label (at most 58 characters)")
+    # A preview's first DNS label, js-<tenant>-<project>, holds at most 63 bytes
+    # and an Argus project identifier is 32 hexadecimal digits: 63 - 4 - 32 = 27.
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", tenant) or len(tenant) > 27:
+        raise ValueError(f"Tenant {tenant!r} must be a lowercase DNS label of at most 27 characters: its "
+                         "JS project previews are js-<tenant>-<32-digit project id>, one 63-byte DNS label")
     return f"https://js-{tenant}-*.{preview_domain(domain)}"
 
 

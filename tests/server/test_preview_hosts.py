@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import uvicorn
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from deploy.native_preview import COOKIE, Ledger, portal_app
+from deploy.native_preview import COOKIE, MODEL, Ledger, load_config, portal_app
 from deploy.native_runtime import sandbox_command
 from deploy.preview_hosts import preview_domain, preview_host, preview_template
 from deploy.try_router import LAST, Router, outward_cookie
@@ -40,10 +41,20 @@ def test_invalid_preview_domain(domain):
         preview_domain(domain)
 
 
-@pytest.mark.parametrize("tenant", ["Upper", "a_b", "../x", "-x", "x-", "a" * 59])
+@pytest.mark.parametrize("tenant", ["Upper", "a_b", "../x", "-x", "x-", "a" * 28])
 def test_invalid_preview_tenant(tenant):
     with pytest.raises(ValueError):
         preview_template(tenant, "argusbot.cn")
+
+
+def test_a_tenant_name_leaves_room_for_a_project_identifier(tmp_path):
+    host = preview_template("a" * 27, "argusbot.cn").replace("*", "0123456789abcdef" * 2)
+    assert preview_host(host.removeprefix("https://"), "argusbot.cn") == (True, "a" * 27)
+    config = tmp_path / "preview.json"
+    config.write_text(json.dumps({"model": MODEL, "runtime": "js", "preview_domain": "argusbot.cn",
+                                  "tenants": {"a" * 28: {}}}))
+    with pytest.raises(ValueError, match="at most 27 characters"):
+        load_config(config)  # the portal and meter refuse it before serving anyone
 
 
 def test_launcher_preview_is_opt_in_and_js_only(tmp_path):

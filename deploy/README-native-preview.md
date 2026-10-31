@@ -149,8 +149,11 @@ With a JS Argus release supporting origin templates in `--preview-url`, add
 `"preview_domain": "argusbot.cn"` to the JS root's private `preview.json` and
 pass `--preview-domain argusbot.cn` to `try_router.py`. The launcher supplies
 `https://js-<tenant>-*.argusbot.cn`; project identifiers contain only lowercase
-letters and digits. Tenant names must be lowercase DNS labels. Without the
-field, no preview argument is passed; Python runtime startup is unchanged.
+letters and digits. Tenant names must be lowercase DNS labels of at most 27
+characters, so that `js-<tenant>-<32-digit project id>` fits one 63-byte DNS
+label; the portal, meter and launcher refuse a `preview.json` naming a longer one
+before anything starts. Without the field, no preview argument is passed; Python
+runtime startup is unchanged.
 
 The operator must add a **proxied wildcard CNAME** `*.argusbot.cn` pointing to
 `<TUNNEL-ID>.cfargotunnel.com`. In the named tunnel configuration, keep the
