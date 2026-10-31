@@ -14,9 +14,11 @@ from pathlib import Path
 # `codex login status`; without it the team daemon refuses to start.
 # Codex sends gpt-6.1-sol's tools in the Responses Lite form, which leaves out hosted web search, and
 # its standalone search calls an endpoint only OpenAI serves. This catalog is Codex's own entry for
-# the model with Lite off, so the meter's upstream gets the web_search tool. It is copied into the
-# Codex package: the one place both the tenant's sandbox and Argus's agent sandbox can read.
+# the model with Lite off, so the meter's upstream gets the web_search tool. It sits beside the
+# tenant's config.toml: Argus's agent sandbox brings each file the config names in on its own and
+# empties the folder around it, so in the Codex package it would hide codex.js.
 CATALOG = Path(__file__).with_name('codex-models.json')
+TENANT_CATALOG = '/tenant/home/.codex/argus-models.json'
 CODEX_CONFIG = '''model = "gpt-6.1-sol"
 model_provider = "meter"
 model_catalog_json = "{catalog}"
@@ -58,9 +60,6 @@ def initialize(args) -> dict:
         if value := getattr(args, key):
             config[key] = str(value.resolve())
     (root / 'meter').mkdir(mode=0o700)
-    if args.agent == 'codex':
-        catalog = Path(config['codex_package']) / 'argus-models.json'
-        shutil.copyfile(CATALOG, catalog)
     for n in range(1, args.tenants + 1):
         name = f'trial{n}'
         directory = root / name
@@ -72,7 +71,8 @@ def initialize(args) -> dict:
         if args.agent == 'codex':
             (directory / 'bin/codex').symlink_to(Path(config['codex_package']) / 'bin/codex.js')
             (directory / 'home/.codex').mkdir(mode=0o700)
-            (directory / 'home/.codex/config.toml').write_text(CODEX_CONFIG.format(catalog=catalog))
+            shutil.copyfile(CATALOG, directory / 'home/.codex/argus-models.json')
+            (directory / 'home/.codex/config.toml').write_text(CODEX_CONFIG.format(catalog=TENANT_CATALOG))
         else:
             (directory / 'bin/copilot').symlink_to(args.node_runtime.resolve() / 'lib/node_modules/@github/copilot/npm-loader.js')
         (directory / 'state/identity.md').write_text(
