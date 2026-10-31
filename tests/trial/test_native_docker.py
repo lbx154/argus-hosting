@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import re
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
@@ -547,6 +548,17 @@ def test_attach_is_checked_then_streams_both_ways(docker):
     [attach] = docker.forwarded()
     assert attach["path"] == "/containers/c-mine/attach" and attach["headers"]["upgrade"] == "tcp"
     assert "content-type" not in attach["headers"]
+
+
+def test_nothing_new_is_pulled_built_or_made_when_dockers_disk_is_nearly_full(docker, monkeypatch):
+    docker.answers["GET", "/info"] = (200, {"DockerRootDir": "/data/docker"})
+    monkeypatch.setattr(native_docker.os, "statvfs", lambda path: os.statvfs_result((4096, 4096, 0, 0, 1024, 0, 0, 0, 0, 255)))
+    responses = docker.send(request("POST", "/v1.55/images/create?fromImage=alpine&tag=3"),
+                            request("POST", "/v1.55/build?t=app"),
+                            request("POST", "/v1.55/containers/create", {"Image": "shared"}),
+                            request("GET", "/v1.55/containers/json"))
+    assert [status(response) for response in responses] == [507, 507, 507, 200]
+    assert b"GiB free" in responses[0] and [r["path"] for r in docker.forwarded()] == ["/containers/json"]
 
 
 def test_a_connection_docker_did_not_take_over_carries_nothing_more(docker):

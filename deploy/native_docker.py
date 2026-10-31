@@ -114,6 +114,8 @@ HOP = {"connection", "keep-alive", "proxy-connection", "te", "trailer", "transfe
 BODY_LIMIT = 1024**2  # a create is a few kB; parsing one holds up every tenant
 DEADLINE = 60  # seconds for a request's head and checked body
 CONNECTIONS = 512  # at once, per tenant
+FLOOR = 20 * 1024**3  # free bytes Docker's disk keeps: below it, nothing new is pulled, built or made
+GROWING = {"pull", "build", "create", "commit"}
 
 
 class Refused(Exception):
@@ -346,6 +348,9 @@ class Gate:
         # The volume holding the tenant's directory, its default network, and its images' namespace.
         self.plumbing = RESERVED + name
         self.connections = 0
+        # asyncio holds tasks weakly: a connection Docker has taken over can leave its
+        # task referenced by nothing, collected mid-stream with the output lost.
+        self.running: set[asyncio.Task] = set()
 
     async def call(self, method: str, path: str, payload=None) -> tuple[int, object]:
         """Ask Docker directly; HTTP/1.0 so the answer is never chunked."""
@@ -519,6 +524,12 @@ class Gate:
                 ref = await (self.image(ref) if kind == "image" else self.owned(kind, ref))
             start, end = request.match.span(kind)
             request.path = request.path[:start] + ref + request.path[end:]
+        if request.rule in GROWING:
+            _, info = await self.call("GET", "/info")
+            disk = (info or {}).get("DockerRootDir")
+            if disk and (room := os.statvfs(disk)).f_bavail * room.f_frsize < FLOOR:
+                raise Refused(507, f"the host's disk for Docker has under {FLOOR // 1024**3} GiB free; remove images "
+                                   "and containers this workspace no longer needs")
         if request.rule:
             await getattr(self, request.rule)(request)
 
@@ -624,6 +635,7 @@ class Gate:
             writer.close()
             return
         self.connections += 1
+        self.running.add(task := asyncio.current_task())
         upstream = watch = None
         answered = False
         try:
@@ -673,6 +685,7 @@ class Gate:
                 refuse(writer, "502 Bad Gateway", f"{type(exc).__name__}: {exc}")
         finally:
             self.connections -= 1
+            self.running.discard(task)
             if watch:
                 watch.cancel()
             writer.close()
