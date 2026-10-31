@@ -762,7 +762,7 @@ def create_app(config: dict | str | Path | Settings | None = None, *,
         app.state.session_limiter = anyio.CapacityLimiter(16)
         vault = Vault(settings.key_file, settings.state_dir / "github-token.enc")
         store = Store(settings.state_dir / "usage.sqlite3", token_limit=settings.token_limit,
-                      key_limit=len(settings.tenants), master_key=settings.key_file)
+                      key_limit=len(settings.tenants))
         # Check provisioned identities, without issuing keys, recovering active
         # requests, or acquiring the model gateway's process ownership lock.
         if any(store.credential(key_id) is None for key_id in settings.tenants):

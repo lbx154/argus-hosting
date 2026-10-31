@@ -22,8 +22,7 @@ def _begin(training, session):
     return training.capture.begin("tenant-one", "s-project", session, observer_verified=True,
                                   allowed_tools=["bash"], runtime_profile=HOSTED_PROFILE, runtime_metadata={
                                       "profile": HOSTED_PROFILE, "capture_id": "a" * 32, "call_id": "capacity-fixture",
-                                      "mission_id": "capacity-task", "source_sha256": {"fixture": "b" * 64},
-                                      "launch_sha256": "c" * 64,
+                                      "mission_id": "capacity-task",
                                   })["episode_id"]
 
 

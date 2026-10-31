@@ -24,7 +24,7 @@ class TrialError(Exception):
 
 class Store:
     def __init__(self, path: Path, *, clock=time.time, token_limit: int | None = TOKEN_LIMIT,
-                 key_limit: int = TRIAL_KEY_COUNT, master_key: Path | None = None):
+                 key_limit: int = TRIAL_KEY_COUNT):
         if token_limit is not None and (type(token_limit) is not int or token_limit <= 0):
             raise ValueError("Trial token limit must be a positive integer")
         if type(key_limit) is not int or not 1 <= key_limit <= 100:
@@ -33,18 +33,13 @@ class Store:
         self.clock = clock
         self.token_limit = token_limit
         self.key_limit = key_limit
-        if master_key is not None:
-            from .credential_migration import migrate_derived_credentials
-
-            migrate_derived_credentials(path, master_key)
         with closing(sqlite3.connect(path)) as db:
             db.executescript("""
                 PRAGMA journal_mode=WAL;
                 CREATE TABLE IF NOT EXISTS trial_keys (
                     key_id TEXT PRIMARY KEY,
                     credential TEXT UNIQUE NOT NULL,
-                    used INTEGER NOT NULL DEFAULT 0 CHECK (used >= 0),
-                    claim_hash TEXT UNIQUE
+                    used INTEGER NOT NULL DEFAULT 0 CHECK (used >= 0)
                 );
                 CREATE TABLE IF NOT EXISTS portal_sessions (
                     token TEXT PRIMARY KEY,
@@ -101,8 +96,6 @@ class Store:
                     created_at REAL NOT NULL
                 );
             """)
-            if "credential" not in {row[1] for row in db.execute("PRAGMA table_info(trial_keys)")}:
-                raise ValueError("Trial keys predate stored credentials; open the store with the master key once")
         path.chmod(0o600)
 
     @contextmanager
@@ -189,13 +182,6 @@ class Store:
         with closing(sqlite3.connect(self.path)) as db:
             row = db.execute("SELECT credential FROM trial_keys WHERE key_id=?", (key_id,)).fetchone()
         return row[0] if row else None
-
-    def availability(self) -> dict:
-        with closing(sqlite3.connect(self.path)) as db:
-            issued, available = db.execute(
-                "SELECT count(*), coalesce(sum(claim_hash IS NULL), 0) FROM trial_keys"
-            ).fetchone()
-        return {"total_keys": max(self.key_limit, issued), "issued_keys": issued, "available_keys": available}
 
     def authenticate(self, credential: str) -> str:
         with closing(sqlite3.connect(self.path)) as db:
