@@ -26,6 +26,8 @@ Run `native_setup.py --help` for the required paths. For example:
   --python-runtime /opt/python-3.12 \
   --node-runtime /opt/node \
   --copilot-package "$HOME/.cache/copilot/pkg" \
+  --upstream-base-url http://127.0.0.1:41419/v1 \
+  --upstream-token-file /srv/private-relay.key \
   --revision FULL_GIT_SHA --install-services
 ```
 
@@ -38,16 +40,12 @@ preserves the file and does not update it automatically. The two source mounts
 remain read-only. See [two-package installation](../README.md#安装到托管机器). Never
 recreate the ledger to replenish a trial.
 
-The meter serializes admission in SQLite, reserves conservative text input and
-capped output cost before submission, and settles from terminal Copilot
-`copilot_usage.total_nano_aiu` receipts. Reservations use twice the observed
-GPT-6.1 tariff (input/cache-write at most $2.50/M, output $10/M). Missing receipts
-or interrupted submissions retain their reservation. A single locked meter
-recovers unfinished requests on restart; portal restarts do not alter charges.
-Hosted tools and remote media references are rejected because their billing
-cannot be bounded from text bytes. Reservations can pause a request before all
-nominal balance has been spent. Confirm tariffs before enabling a new provider
-version. There are at most two simultaneous upstream model requests.
+The meter is a pipe. It swaps a tenant's token for the upstream key, forwards
+the request unchanged, records in SQLite the price of the usage the upstream's
+receipt reports, and answers 402 once less than a cent is left of the
+invitation's or the whole trial's allowance. A call without a receipt is not
+charged; calls already running can overdraw what was left. Confirm tariffs
+before enabling a new provider version.
 
 ## Runtime boundaries
 

@@ -17,11 +17,8 @@ from deploy.native_preview import (
     COOKIE,
     MODEL,
     Ledger,
-    QuotaExceeded,
-    admit,
     model_app,
     portal_app,
-    provider_cost,
     token_cost,
 )
 from deploy.native_runtime import sandbox_command
@@ -30,7 +27,7 @@ from deploy.native_runtime import sandbox_command
 @pytest.fixture
 def config(tmp_path):
     return {'model': MODEL, 'revision': 'test-sha', 'relay_secret': 'private-relay-key',
-            'copilot_home': str(tmp_path / 'not-logged-in'),
+            'upstream': {'base_url': 'https://relay.example/v1/', 'token_file': str(tmp_path / 'upstream.key')},
             'tenants': {'alice': {'invite': 'invite-a', 'model_token': 'meter-a', 'web_token': 'web-a', 'socket': str(tmp_path / 'a.sock')},
                         'bob': {'invite': 'invite-b', 'model_token': 'meter-b', 'web_token': 'web-b', 'socket': str(tmp_path / 'b.sock')}}}
 
@@ -40,68 +37,54 @@ def ledger(tmp_path):
     return Ledger(tmp_path / 'ledger.sqlite3', total_usd=50, user_usd=10)
 
 
-def test_two_limits_are_atomic_and_never_reset(tmp_path):
+def upstream(monkeypatch, tmp_path, reply):
+    """Answer the meter's upstream calls with ``reply(request)`` and return what it sent."""
+    (tmp_path / 'upstream.key').write_text('upstream-secret\n')
+    sent = []
+    def provider(request):
+        sent.append(request)
+        return reply(request)
+    original = httpx.AsyncClient
+    monkeypatch.setattr('deploy.native_preview.httpx.AsyncClient',
+                        lambda **kwargs: original(transport=httpx.MockTransport(provider)))
+    return sent
+
+
+def completed(usage):
+    event = {'type': 'response.completed', 'response': {'id': 'r', 'status': 'completed', 'output': [], 'usage': usage}}
+    return httpx.Response(200, headers={'Content-Type': 'text/event-stream'},
+                          content=b'data: {"type": "response.output_text.delta", "delta": "hi"}\n\n'
+                                  + ('data: ' + json.dumps(event) + '\n\n').encode())
+
+
+def price(input_tokens, output_tokens, cached=0):
+    from argus.core.pricing import quote_token_usage
+    return quote_token_usage(MODEL, input_tokens=input_tokens, output_tokens=output_tokens, cached_input_tokens=cached).cost_usd
+
+
+def test_allowances_refuse_once_spent_and_never_reset(tmp_path):
     ledger = Ledger(tmp_path / 'ledger', total_usd=50, user_usd=10)
-    def reserve(_):
-        try:
-            return ledger.reserve('alice', 1)
-        except QuotaExceeded:
-            return None
     with ThreadPoolExecutor(max_workers=16) as pool:
-        ids = [identity for identity in pool.map(reserve, range(50)) if identity]
-    assert len(ids) == 10
-    for tenant in ('bob', 'c', 'd', 'e'):
-        ledger.reserve(tenant, 10)
-    with pytest.raises(QuotaExceeded):
-        ledger.reserve('new-user', 0.000001)
+        list(pool.map(lambda _: ledger.charge('alice', 0.2), range(50)))
+    assert '这个邀请码的 10 美元已经用完' in ledger.refusal('alice')
+    assert ledger.refusal('bob') == ''
+    ledger.charge('bob', 12.5)  # a receipt is charged in full, even past what was left
+    assert ledger.status('bob')['used_usd'] == 12.5 and ledger.status('bob')['remaining_usd'] == 0
+    for tenant in ('c', 'd', 'e'):
+        ledger.charge(tenant, 9)
+    assert ledger.refusal('new-user') == ''
+    ledger.charge('f', 0.495)
+    assert '全站共 50 美元的额度已经用完' in ledger.refusal('new-user')
     reopened = Ledger(tmp_path / 'ledger', total_usd=50, user_usd=10)
-    assert reopened.status('alice')['remaining_usd'] == 0
-    reopened.settle(ids[0], 0.2)  # Opening the portal cannot mark live calls uncertain.
-    assert reopened.status('alice')['remaining_usd'] == pytest.approx(0.8)
+    assert reopened.status('alice')['used_usd'] == pytest.approx(10)
     with pytest.raises(ValueError, match='cannot be reset'):
         Ledger(tmp_path / 'ledger', total_usd=500, user_usd=100)
-
-
-def test_a_call_larger_than_what_is_left_is_admitted_for_the_rest(ledger):
-    first = ledger.reserve('alice', 6.88)
-    ledger.settle(first, 6.88)
-    capped = ledger.reserve('alice', 4.5)  # a long-context ceiling above the $3.12 left
-    assert ledger.status('alice')['remaining_usd'] == 0
-    ledger.settle(capped, 0.9)  # settles at the real cost
-    assert ledger.status('alice')['remaining_usd'] == pytest.approx(2.22)
-    last = ledger.reserve('alice', 5)
-    ledger.settle(last, 2.5)  # overdraws by at most that one call
-    assert ledger.status('alice')['remaining_usd'] == 0
-    with pytest.raises(QuotaExceeded):
-        ledger.reserve('alice', 0.5)
-
-
-def test_missing_receipts_stay_charged_and_settlement_is_idempotent(ledger):
-    identity = ledger.reserve('alice', 3)
-    ledger.settle(identity, None)
-    ledger.settle(identity, 0)
-    assert ledger.status('alice')['used_usd'] == 3
-    identity = ledger.reserve('alice', 2)
-    ledger.settle(identity, 0.1234561)
-    ledger.settle(identity, 1)
-    assert ledger.status('alice')['used_usd'] == pytest.approx(3.123457)
-    identity = ledger.reserve('bob', 1)
-    ledger.recover()
-    ledger.settle(identity, 0)
-    assert ledger.status('bob')['used_usd'] == 1
 
 
 @pytest.mark.parametrize('value', [-1, float('nan'), float('inf')])
 def test_invalid_amounts(ledger, value):
     with pytest.raises(ValueError):
-        ledger.reserve('alice', value)
-
-
-def test_authoritative_billing_only():
-    from argus.provider_integrations.copilot_usage import NANO_AIU_PER_USD
-    assert provider_cost({'copilot_usage': {'total_nano_aiu': NANO_AIU_PER_USD}}) == 1
-    for event in ({}, {'copilot_usage': {'total_nano_aiu': -1}}, {'copilot_usage': {'total_nano_aiu': True}}):
-        assert provider_cost(event) is None
+        ledger.charge('alice', value)
 
 
 def test_login_cookie_auth_and_tenant_budgets(config, ledger):
@@ -113,7 +96,7 @@ def test_login_cookie_auth_and_tenant_budgets(config, ledger):
     response = client.post('/login', data={'invite': 'invite-a'}, follow_redirects=False)
     assert response.status_code == 303
     assert 'Secure' in response.headers['set-cookie'] and 'HttpOnly' in response.headers['set-cookie']
-    ledger.settle(ledger.reserve('alice', 1), 0.1)
+    ledger.charge('alice', 0.1)
     assert client.get('/trial/budget').json()['used_usd'] == 0.1
     assert client.post('/api/daemons', json={}, headers={'Origin': 'https://evil.example'}).status_code == 403
     assert client.post('/api/projects/test/config/set', json={}).status_code == 403
@@ -167,130 +150,72 @@ def test_sandbox_has_no_host_network_home_or_cross_tenant_mount(config, tmp_path
     assert '--proc' in command and '--cap-drop' in command
     assert str(tmp_path / 'alice') in command and str(tmp_path / 'bob') not in command
     assert str(Path.home()) not in command
-    assert config['copilot_home'] not in command
     assert command[-1] == '/bin/true'
 
 
-@pytest.mark.parametrize('streaming', [True, False])
-def test_meter_streams_real_receipt_and_settles_exactly(config, ledger, monkeypatch, streaming):
-    home = Path(config['copilot_home'])
-    home.mkdir()
-    (home / 'config.json').write_text(json.dumps({'lastLoggedInUser': {'host': 'test', 'login': 'operator'},
-                                                'authTokens': {'test:operator': {'token': 'operator-only'}}}))
-    from argus.provider_integrations.copilot_usage import NANO_AIU_PER_USD
-    seen = []
-    def provider(request):
-        seen.append(json.loads(request.content))
-        assert request.headers['authorization'] == 'Bearer operator-only'
-        event = {'type': 'response.completed', 'copilot_usage': {'total_nano_aiu': NANO_AIU_PER_USD // 10},
-                 'response': {'id': 'response-1', 'status': 'completed', 'output': []}}
-        return httpx.Response(200, headers={'Content-Type': 'text/event-stream'},
-                              content=('data: ' + json.dumps(event) + '\n\n').encode())
-    original = httpx.AsyncClient
-    monkeypatch.setattr('deploy.native_preview.httpx.AsyncClient',
-                        lambda **kwargs: original(transport=httpx.MockTransport(provider)))
-    client = TestClient(model_app(config, ledger))
-    r = client.post('/v1/responses', headers={'Authorization': 'Bearer meter-a'},
-                    json={'model': MODEL, 'input': 'hello', 'max_output_tokens': 256, 'stream': streaming})
-    assert r.status_code == 200
-    assert seen[0]['stream'] is True and seen[0]['store'] is False
-    assert ledger.status('alice')['used_usd'] == 0.1
+def test_meter_forwards_the_request_unchanged_and_charges_the_receipt(config, ledger, monkeypatch, tmp_path):
+    """Hosted tools, item references, remote images and a 3 MB conversation all reach the upstream as sent."""
+    sent = upstream(monkeypatch, tmp_path, lambda request: completed(
+        {'input_tokens': 100_000, 'output_tokens': 10_000, 'input_tokens_details': {'cached_tokens': 40_000}}))
+    body = json.dumps({'model': 'any-model', 'stream': True, 'store': True, 'previous_response_id': 'p',
+                       'tools': [{'type': 'web_search'}, {'type': 'code_interpreter'}], 'tool_choice': {'type': 'web_search'},
+                       'input': [{'type': 'item_reference', 'id': 'x'},
+                                 {'role': 'user', 'content': [{'type': 'input_image', 'image_url': 'https://x/y.png'},
+                                                              {'type': 'input_text', 'text': 'x' * 3_000_000}]}]}).encode()
+    r = TestClient(model_app(config, ledger)).post('/v1/responses', content=body, headers={
+        'Authorization': 'Bearer meter-a', 'Content-Type': 'application/json'})
+    assert r.status_code == 200 and r.text.count('data:') == 2 and 'response.completed' in r.text
+    assert str(sent[0].url) == 'https://relay.example/v1/responses'
+    assert sent[0].headers['authorization'] == 'Bearer upstream-secret' and sent[0].content == body
+    assert ledger.status('alice')['used_usd'] == pytest.approx(price(100_000, 10_000, 40_000), abs=1e-6)
     assert ledger.status('bob')['used_usd'] == 0
-    if streaming:
-        assert 'response.completed' in r.text
-    else:
-        assert r.json()['status'] == 'completed'
 
 
-def test_token_usage_is_priced_and_missing_usage_keeps_the_reservation():
-    from argus.core.pricing import quote_token_usage
-    usage = {'input_tokens': 1_000_000, 'output_tokens': 100_000, 'input_tokens_details': {'cached_tokens': 400_000}}
-    expected = quote_token_usage(MODEL, input_tokens=1_000_000, output_tokens=100_000, cached_input_tokens=400_000).cost_usd
-    assert token_cost({'type': 'response.completed', 'response': {'usage': usage}}) == pytest.approx(expected)
-    assert expected > 0
-    for event in ({}, {'response': {}}, {'response': {'usage': {'input_tokens': 5}}},
-                  {'response': {'usage': {'input_tokens': -1, 'output_tokens': 1}}}):
-        assert token_cost(event) is None
-
-
-def test_meter_sends_to_a_configured_upstream_and_charges_its_usage(config, ledger, monkeypatch, tmp_path):
-    key = tmp_path / 'upstream.key'
-    key.write_text('upstream-secret\n')
-    config['upstream'] = {'base_url': 'https://relay.example/v1/', 'token_file': str(key)}
-    seen = []
-    def provider(request):
-        seen.append(str(request.url))
-        assert request.headers['authorization'] == 'Bearer upstream-secret'
-        event = {'type': 'response.completed', 'response': {'id': 'r', 'status': 'completed', 'output': [],
-                 'usage': {'input_tokens': 100_000, 'output_tokens': 10_000}}}
-        return httpx.Response(200, headers={'Content-Type': 'text/event-stream'},
-                              content=('data: ' + json.dumps(event) + '\n\n').encode())
-    original = httpx.AsyncClient
-    monkeypatch.setattr('deploy.native_preview.httpx.AsyncClient',
-                        lambda **kwargs: original(transport=httpx.MockTransport(provider)))
+def test_meter_charges_a_whole_response_too(config, ledger, monkeypatch, tmp_path):
+    response = {'id': 'r', 'status': 'completed', 'output': [], 'usage': {'input_tokens': 1000, 'output_tokens': 100}}
+    upstream(monkeypatch, tmp_path, lambda request: httpx.Response(200, json=response))
     r = TestClient(model_app(config, ledger)).post('/v1/responses', headers={'Authorization': 'Bearer meter-a'},
-                                                   json={'model': MODEL, 'input': 'hello', 'max_output_tokens': 256})
-    assert r.status_code == 200
-    assert seen == ['https://relay.example/v1/responses']
-    from argus.core.pricing import quote_token_usage
-    expected = quote_token_usage(MODEL, input_tokens=100_000, output_tokens=10_000, cached_input_tokens=0).cost_usd
-    assert ledger.status('alice')['used_usd'] == pytest.approx(expected, abs=1e-6)
+                                                   json={'model': MODEL, 'input': 'hello'})
+    assert r.json() == response
+    assert ledger.status('alice')['used_usd'] == pytest.approx(price(1000, 100), abs=1e-6)
 
 
-def test_meter_forwards_a_long_conversation_and_explains_upstream_failures(config, ledger, monkeypatch, tmp_path):
-    """A 3 MB request (a long Codex task, ~140k tokens) used to be refused at 2 MB."""
-    key = tmp_path / 'upstream.key'
-    key.write_text('upstream-secret\n')
-    config['upstream'] = {'base_url': 'https://relay.example/v1/', 'token_file': str(key)}
-    seen, replies = [], [httpx.Response(429, text='slow down')]
-    def provider(request):
-        seen.append(json.loads(request.content))
-        if replies:
-            return replies.pop()
-        event = {'type': 'response.completed', 'response': {'id': 'r', 'status': 'completed', 'output': [],
-                 'usage': {'input_tokens': 100, 'output_tokens': 10}}}
-        return httpx.Response(200, headers={'Content-Type': 'text/event-stream'},
-                              content=('data: ' + json.dumps(event) + '\n\n').encode())
-    original = httpx.AsyncClient
-    monkeypatch.setattr('deploy.native_preview.httpx.AsyncClient',
-                        lambda **kwargs: original(transport=httpx.MockTransport(provider)))
-    client = TestClient(model_app(config, ledger))
-    body = {'model': MODEL, 'input': 'x' * 3_000_000}
-    busy = client.post('/v1/responses', headers={'Authorization': 'Bearer meter-a'}, json=body)
-    assert busy.status_code == 429
-    assert '被限流' in busy.json()['error']['message'] and 'slow down' in busy.json()['error']['message']
-    r = client.post('/v1/responses', headers={'Authorization': 'Bearer meter-a'}, json=body)
-    assert r.status_code == 200
-    assert 'max_output_tokens' not in seen[-1]  # the requested output is no longer cut to 16k
+def test_token_usage_is_priced_and_missing_usage_is_none():
+    usage = {'input_tokens': 1_000_000, 'output_tokens': 100_000, 'input_tokens_details': {'cached_tokens': 400_000}}
+    assert token_cost({'usage': usage}) == pytest.approx(price(1_000_000, 100_000, 400_000))
+    assert price(1_000_000, 100_000, 400_000) > 0
+    for response in (None, [], {}, {'usage': {'input_tokens': 5}}, {'usage': {'input_tokens': -1, 'output_tokens': 1}}):
+        assert token_cost(response) is None
 
 
-def test_a_stream_cut_before_its_receipt_charges_an_estimate_not_the_reservation(config, ledger, monkeypatch, tmp_path):
-    """Twelve broken streams once settled at their full reservations and drained a code's $50 in 17 minutes."""
-    from deploy.native_preview import interrupted_cost
-    key = tmp_path / 'upstream.key'
-    key.write_text('upstream-secret\n')
-    config['upstream'] = {'base_url': 'https://relay.example/v1/', 'token_file': str(key)}
-    def provider(request):
-        return httpx.Response(200, headers={'Content-Type': 'text/event-stream'},
-                              content=b'data: {"type": "response.output_text.delta", "delta": "half"}\n\n')
-    original = httpx.AsyncClient
-    monkeypatch.setattr('deploy.native_preview.httpx.AsyncClient',
-                        lambda **kwargs: original(transport=httpx.MockTransport(provider)))
-    body = {'model': MODEL, 'input': 'x' * 1_000_000, 'stream': True}
-    TestClient(model_app(config, ledger)).post('/v1/responses', headers={'Authorization': 'Bearer meter-a'}, json=body)
-    used = ledger.status('alice')['used_usd']
-    assert 0 < used <= interrupted_cost(1_000_100) + 1e-6
-    assert used < 0.5
+def test_upstream_answers_reach_the_tenant_as_they_are_and_cost_nothing(config, ledger, monkeypatch, tmp_path):
+    upstream(monkeypatch, tmp_path, lambda request: httpx.Response(429, json={'error': {'message': 'slow down'}}))
+    r = TestClient(model_app(config, ledger)).post('/v1/responses', headers={'Authorization': 'Bearer meter-a'},
+                                                   json={'model': MODEL, 'input': 'hello'})
+    assert r.status_code == 429 and r.json() == {'error': {'message': 'slow down'}}
+    assert ledger.status('alice')['used_usd'] == 0
 
 
-def test_meter_exhaustion_never_submits_to_provider(config, ledger, monkeypatch):
-    ledger.reserve('alice', 10)
-    def unexpected(**kwargs):
-        raise AssertionError('Quota rejection must precede upstream submission')
-    monkeypatch.setattr('deploy.native_preview.httpx.AsyncClient', unexpected)
+def test_a_stream_cut_before_its_receipt_is_not_charged(config, ledger, monkeypatch, tmp_path):
+    """Estimates once charged broken streams; only what a receipt reports is charged."""
+    upstream(monkeypatch, tmp_path, lambda request: httpx.Response(200, headers={'Content-Type': 'text/event-stream'},
+             content=b'data: {"type": "response.output_text.delta", "delta": "half"}\n\n'))
+    r = TestClient(model_app(config, ledger)).post('/v1/responses', headers={'Authorization': 'Bearer meter-a'},
+                                                   json={'model': MODEL, 'input': 'x' * 1_000_000, 'stream': True})
+    assert 'half' in r.text
+    assert ledger.status('alice')['used_usd'] == 0
+
+
+def test_a_spent_allowance_or_an_oversized_request_never_reaches_the_upstream(config, ledger, monkeypatch, tmp_path):
+    sent = upstream(monkeypatch, tmp_path, lambda request: completed({'input_tokens': 1, 'output_tokens': 1}))
     client = TestClient(model_app(config, ledger))
     assert client.post('/v1/responses', headers={'Authorization': 'Bearer meter-a'},
-                       json={'model': MODEL, 'input': 'hello'}).status_code == 402
+                       content=b'x' * (16 * 1024 * 1024 + 1)).status_code == 413
+    ledger.charge('alice', 10)
+    r = client.post('/v1/responses', headers={'Authorization': 'Bearer meter-a'}, json={'model': MODEL, 'input': 'hello'})
+    assert r.status_code == 402 and r.json()['error']['code'] == 'trial_budget_exhausted'
+    assert client.post('/v1/responses', headers={'Authorization': 'Bearer nobody'}, json={}).status_code == 401
+    assert sent == []
 
 
 def test_browser_stream_requires_session_and_same_origin_and_cannot_choose_other_api(config, ledger):
@@ -402,7 +327,7 @@ def test_stopping_the_runtime_lets_its_daemons_record_the_stop(tmp_path):
 
 def test_unavailable_workspace_shows_retry_page_and_preserves_allowance(config, ledger):
     client = TestClient(portal_app(config, ledger), base_url='https://preview.example')
-    ledger.settle(ledger.reserve('alice', 1), 0.25)
+    ledger.charge('alice', 0.25)
     client.post('/login', data={'invite': 'invite-a'}, follow_redirects=False)
     response = client.get('/')
     assert response.status_code == 503
@@ -572,49 +497,6 @@ def test_launch_restarts_into_and_out_of_a_storage_pause(tmp_path, monkeypatch, 
         native_runtime.main()
     assert result.value.code == 75  # Restart=on-failure brings the runtime back either way
     assert (read_storage_pause(directory / 'state') is None) is paused
-
-
-def test_admit_keeps_billable_media_and_web_search_and_drops_what_it_cannot_bill():
-    payload = {'model': MODEL, 'tools': [{'type': 'function', 'name': 'f'}, {'type': 'web_search'}],
-               'tool_choice': {'type': 'web_search'},
-               'input': [{'type': 'item_reference', 'id': 'r1'},
-                         {'role': 'user', 'content': [{'type': 'input_text', 'text': 'look'},
-                                                      {'type': 'input_image', 'image_url': 'data:image/png;base64,AAAA'}]}]}
-    refusal, dropped = admit(payload, priced_by_usage=True)
-    assert refusal == ''
-    assert dropped == {'item_reference'}
-    assert [tool['type'] for tool in payload['tools']] == ['function', 'web_search']
-    assert payload['tool_choice'] == {'type': 'web_search'}
-    hosted = {'tools': [{'type': 'code_interpreter'}, {'type': 'web_search'}], 'tool_choice': {'type': 'code_interpreter'}}
-    assert admit(hosted, priced_by_usage=True) == ('', {'tool:code_interpreter'})
-    assert hosted == {'tools': [{'type': 'web_search'}]}
-    assert len(payload['input']) == 1 and payload['input'][0]['content'][1]['type'] == 'input_image'
-    remote = {'input': [{'role': 'user', 'content': [{'type': 'input_image', 'image_url': 'https://x/y.png'}]}]}
-    assert admit(remote, priced_by_usage=True)[0] == 'input_image without inline data'
-    inline = {'input': [{'role': 'user', 'content': [{'type': 'input_image', 'image_url': 'data:image/png;base64,AA'}]}]}
-    assert admit(inline, priced_by_usage=False)[0] == 'input_image'
-
-
-def test_meter_forwards_a_subagent_request_with_hosted_tools_to_a_priced_upstream(config, ledger, monkeypatch, tmp_path):
-    key = tmp_path / 'upstream.key'
-    key.write_text('upstream-secret')
-    config['upstream'] = {'base_url': 'https://relay.example/v1', 'token_file': str(key)}
-    sent = []
-    def provider(request):
-        sent.append(json.loads(request.content))
-        event = {'type': 'response.completed', 'response': {'id': 'r', 'status': 'completed', 'output': [],
-                 'usage': {'input_tokens': 10, 'output_tokens': 1}}}
-        return httpx.Response(200, headers={'Content-Type': 'text/event-stream'},
-                              content=('data: ' + json.dumps(event) + '\n\n').encode())
-    original = httpx.AsyncClient
-    monkeypatch.setattr('deploy.native_preview.httpx.AsyncClient',
-                        lambda **kwargs: original(transport=httpx.MockTransport(provider)))
-    r = TestClient(model_app(config, ledger)).post('/v1/responses', headers={'Authorization': 'Bearer meter-a'}, json={
-        'model': MODEL, 'max_output_tokens': 64, 'tools': [{'type': 'function', 'name': 'task'}, {'type': 'web_search'}],
-        'input': [{'type': 'item_reference', 'id': 'x'}, {'role': 'user', 'content': [{'type': 'input_text', 'text': 'review'}]}]})
-    assert r.status_code == 200
-    assert [tool['type'] for tool in sent[0]['tools']] == ['function', 'web_search']
-    assert all(item.get('type') != 'item_reference' for item in sent[0]['input'])
 
 
 def test_a_portal_restart_keeps_signed_in_sessions(config, ledger):

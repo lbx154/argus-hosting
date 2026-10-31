@@ -40,22 +40,12 @@ except ImportError:  # Direct deployment script entry point.
 COOKIE = "__Host-argus_preview_session"
 MODEL = "gpt-6.1-sol"
 MICRO = 1_000_000
-# Twice the authoritative rates observed from Copilot token_details for this
-# model: input/cache-write <= $2.50/M, output/reasoning $10/M. Reserve from
-# UTF-8 bytes (an upper bound on text tokens), framing and the requested output.
-INPUT_CEILING = 5.0 / MICRO
-OUTPUT_CEILING = 20.0 / MICRO
-# The model relay's own limit (copilot-codex-relay MAX_REQUEST_BYTES): it drops
-# a larger request unread, so it is refused here, before anything is reserved.
+# The model relay's own limit (copilot-codex-relay MAX_REQUEST_BYTES): past it the
+# relay drops the connection unanswered, so the meter says why instead.
 MAX_BODY = 16 * 1024 * 1024
-DEFAULT_OUTPUT = 32768  # reserved for when a request names no output cap
-# A reservation holds money only while its call runs and settles at the real
-# cost, which for a long conversation is mostly cached input. Capping it keeps
-# one long call from blocking the tenant's parallel calls on money it won't spend.
-MAX_RESERVATION = 1.0
 MIN_ADMIT = 10_000  # $0.01 in micro-dollars
 UPLOAD_LIMIT = 256 * 1024 * 1024  # one browser upload, buffered by the portal
-RETRY_LATER = "会自动重试；如果任务还是停了，稍后在对话里说“继续”即可接着做，已有文件都保留着。"
+RECEIPTS = ("response.completed", "response.incomplete", "response.failed")
 
 
 async def bounded_body(request: Request, maximum: int) -> bytes:
@@ -65,10 +55,6 @@ async def bounded_body(request: Request, maximum: int) -> bytes:
             raise ValueError("Request body limit")
         result.extend(chunk)
     return bytes(result)
-
-
-class QuotaExceeded(Exception):
-    pass
 
 
 class Ledger:
@@ -94,82 +80,45 @@ class Ledger:
             db.commit()
         path.chmod(0o600)
 
-    def recover(self) -> None:
-        # Called only by the exclusively locked meter, never the portal.
-        with closing(sqlite3.connect(self.path)) as db:
-            db.execute("UPDATE charges SET state='uncertain' WHERE state='reserved'")
-            db.commit()
-
-    def reserve(self, tenant: str, usd: float) -> str:
+    def charge(self, tenant: str, usd: float) -> None:
         if not math.isfinite(usd) or usd < 0:
-            raise ValueError("Invalid reservation")
-        amount = math.ceil(usd * MICRO)
+            raise ValueError("Invalid charge")
         with closing(sqlite3.connect(self.path, timeout=10)) as db:
-            db.execute("BEGIN IMMEDIATE")
-            total = db.execute("SELECT COALESCE(SUM(amount),0) FROM charges").fetchone()[0]
-            used = db.execute("SELECT COALESCE(SUM(amount),0) FROM charges WHERE tenant=?", (tenant,)).fetchone()[0]
-            # The reservation is a ceiling far above a typical call (text bytes as
-            # tokens at twice the tariff), so a call that does not fit what is
-            # left is still admitted for what is left: it settles at its real
-            # cost, which can overdraw by at most that one call. Nothing is
-            # admitted once less than MIN_ADMIT remains.
-            limit = self.allowances.get(tenant, self.user)
-            if refusal := self.refusal(limit, total, used, amount):
-                db.rollback()
-                raise QuotaExceeded(refusal)
-            amount = min(amount, self.total - total, limit - used)
-            identity = secrets.token_hex(16)
-            db.execute("INSERT INTO charges VALUES(?,?,?,?,?)", (identity, tenant, amount, "reserved", time.time()))
+            db.execute("INSERT INTO charges VALUES(?,?,?,?,?)",
+                       (secrets.token_hex(16), tenant, math.ceil(usd * MICRO), "settled", time.time()))
             db.commit()
-            return identity
 
-    def refusal(self, limit: int, total: int, used: int, amount: int = MIN_ADMIT) -> str:
-        """Why a call reserving ``amount`` is not admitted ("" if it is): the meter's 402 and the page's notice."""
-        if min(self.total - total, limit - used) >= min(amount, MIN_ADMIT):
+    def usage(self, tenant: str) -> tuple[int, int, int]:
+        """The tenant's allowance, what it has used and what the whole trial has used."""
+        with closing(sqlite3.connect(self.path, timeout=10)) as db:
+            used = db.execute("SELECT COALESCE(SUM(amount),0) FROM charges WHERE tenant=?", (tenant,)).fetchone()[0]
+            total = db.execute("SELECT COALESCE(SUM(amount),0) FROM charges").fetchone()[0]
+        return self.allowances.get(tenant, self.user), used, total
+
+    def refusal(self, tenant: str) -> str:
+        """Why the tenant's next call is not forwarded ("" if it is): the meter's 402 and the page's notice.
+        Calls already running are charged at their receipts, so they can overdraw what was left."""
+        limit, used, total = self.usage(tenant)
+        if min(self.total - total, limit - used) >= MIN_ADMIT:
             return ""
         whose = (f"这一版全站共 {self.total / MICRO:g} 美元的额度" if self.total - total < limit - used
                  else f"这个邀请码的 {limit / MICRO:g} 美元")
         return f"试用额度已用完：{whose}已经用完，任务已暂停，已有文件都保留着。需要继续请联系提供邀请码的人加额度。"
 
-    def settle(self, identity: str, usd: float | None) -> None:
-        if usd is not None and (not math.isfinite(usd) or usd < 0):
-            raise ValueError("Invalid charge")
-        with closing(sqlite3.connect(self.path)) as db:
-            if usd is None:
-                db.execute("UPDATE charges SET state='uncertain' WHERE id=? AND state='reserved'", (identity,))
-            else:
-                db.execute("UPDATE charges SET amount=?,state='settled' WHERE id=? AND state='reserved'",
-                           (math.ceil(usd * MICRO), identity))
-            db.commit()
-
     def status(self, tenant: str) -> dict:
-        with closing(sqlite3.connect(self.path)) as db:
-            used = db.execute("SELECT COALESCE(SUM(amount),0) FROM charges WHERE tenant=?", (tenant,)).fetchone()[0]
-            total = db.execute("SELECT COALESCE(SUM(amount),0) FROM charges").fetchone()[0]
-        limit = self.allowances.get(tenant, self.user)
+        limit, used, total = self.usage(tenant)
         return {"model": MODEL, "limit_usd": limit / MICRO, "used_usd": used / MICRO,
                 "remaining_usd": max(0, limit - used) / MICRO,
                 "total_limit_usd": self.total / MICRO,
-                "total_remaining_usd": max(0, self.total - total) / MICRO, "concurrency": 2,
-                "exhausted": self.refusal(limit, total, used)}
+                "total_remaining_usd": max(0, self.total - total) / MICRO,
+                "exhausted": self.refusal(tenant)}
 
 
-def provider_cost(event: dict) -> float | None:
-    from argus.provider_integrations.copilot_usage import NANO_AIU_PER_USD
-
-    usage = event.get("copilot_usage")
-    if not isinstance(usage, dict):
-        return None
-    value = usage.get("total_nano_aiu")
-    return value / NANO_AIU_PER_USD if type(value) is int and value >= 0 else None
-
-
-def token_cost(event: dict) -> float | None:
-    """Price a terminal Responses event from the usage an OpenAI-compatible
-    upstream reports; ``None`` keeps the reservation when usage is missing."""
+def token_cost(response) -> float | None:
+    """Price a Responses result from the usage its upstream reports; ``None`` when there is none."""
     from argus.core.pricing import quote_token_usage
 
-    usage = (event.get("response") or {}).get("usage")
+    usage = response.get("usage") if isinstance(response, dict) else None
     if not isinstance(usage, dict):
         return None
     counts = [usage.get("input_tokens"), usage.get("output_tokens")]
@@ -179,83 +128,6 @@ def token_cost(event: dict) -> float | None:
     quote = quote_token_usage(MODEL, input_tokens=counts[0], output_tokens=counts[1],
                               cached_input_tokens=cached if type(cached) is int else 0)
     return quote.cost_usd if quote.status == "priced" else None
-
-
-BILLED_TOOLS = ("function", "custom", "web_search")
-
-
-def admit(payload: dict, *, priced_by_usage: bool) -> tuple[str, set[str]]:
-    """Make a request billable or say why it cannot be.
-
-    The reservation is bounded by the request's bytes, so content those bytes
-    carry is admissible when the upstream bills it in its reported usage:
-    inline (data:) images and files. Web search is kept: what it read comes back
-    in the reported usage, so a team can look things up. Remote media and other
-    hosted tools are billed outside that usage and are refused or dropped; item
-    references cannot be resolved with ``store=False`` and are dropped. Copilot's
-    receipts cover text, function tools and web search only, so without a
-    usage-priced upstream media is refused. Returns the refusal reason ("" to
-    proceed) and what was dropped."""
-    dropped: set[str] = set()
-    tools = payload.get("tools") or []
-    kept = [tool for tool in tools if tool.get("type") in BILLED_TOOLS]
-    dropped.update(f"tool:{tool.get('type')}" for tool in tools if tool not in kept)
-    if tools:
-        payload["tools"] = kept
-        choice = payload.get("tool_choice")
-        if isinstance(choice, dict) and choice.get("type") not in (None, *BILLED_TOOLS):
-            payload.pop("tool_choice")
-
-    def walk(value):
-        if isinstance(value, list):
-            kept_items = []
-            for item in value:
-                if isinstance(item, dict) and item.get("type") == "item_reference":
-                    dropped.add("item_reference")
-                    continue
-                reason = walk(item)
-                if reason:
-                    return reason
-                kept_items.append(item)
-            value[:] = kept_items
-            return ""
-        if not isinstance(value, dict):
-            return ""
-        kind = value.get("type")
-        if kind in ("input_image", "input_file", "input_audio"):
-            if not priced_by_usage:
-                return kind
-            source = value.get("image_url") or value.get("file_url") or ""
-            if isinstance(source, dict):
-                source = source.get("url", "")
-            if kind == "input_audio" or (source and not str(source).startswith("data:")) or value.get("file_id"):
-                return f"{kind} without inline data"
-        for child in value.values():
-            reason = walk(child)
-            if reason:
-                return reason
-        return ""
-
-    return walk(payload), dropped
-
-
-def upstream_request(config: dict) -> tuple[str, dict, object]:
-    """Where the meter sends a tenant's request, with which headers, and how a
-    terminal event is charged. ``upstream`` names an OpenAI-compatible
-    Responses endpoint and a file holding its key; without it the operator's
-    Copilot login is used and billed from its receipts."""
-    upstream = config.get("upstream")
-    if upstream:
-        key = Path(upstream["token_file"]).read_text().strip()
-        return upstream["base_url"].rstrip("/") + "/responses", {"Authorization": "Bearer " + key}, token_cost
-    from argus.agent_cli.copilot_home import _read_managed_config
-    from argus.core.copilot_http import COPILOT_BASE_URL, COPILOT_HEADERS
-
-    provider = _read_managed_config(Path(config["copilot_home"]) / "config.json")
-    account = provider["lastLoggedInUser"]
-    token = provider["authTokens"][f"{account['host']}:{account['login']}"]["token"]
-    return (COPILOT_BASE_URL + "/responses",
-            {**COPILOT_HEADERS, "Authorization": "Bearer " + token, "X-Initiator": "user"}, provider_cost)
 
 
 def load_config(path: Path) -> dict:
@@ -268,40 +140,24 @@ def load_config(path: Path) -> dict:
     return value
 
 
-def interrupted_cost(size: int) -> float:
-    """What a call cut off before its receipt most likely cost: its input read
-    once, mostly from cache, and no output. Keeping the whole reservation
-    instead drained a code's allowance a few dollars per broken stream."""
-    from argus.core.pricing import quote_token_usage
-
-    tokens = size // 4
-    quote = quote_token_usage(MODEL, input_tokens=tokens, output_tokens=0, cached_input_tokens=tokens * 9 // 10)
-    return quote.cost_usd if quote.status == "priced" else 0.0
-
-
-def provider_error(status: int, detail: str) -> str:
-    """What a failed upstream call means for the person, and what to do."""
-    said = f"（模型服务返回 {status}：{detail.strip()[:300]}）" if detail.strip() else f"（模型服务返回 {status}）"
-    if status == 413:
-        return ("这一轮对话太长，超过了模型服务单次能接收的上限，任务停了下来。请新建一个项目，"
-                "把要接着做的事说清楚，已有文件都在原项目里。" + said)
-    if status == 429:
-        return "模型服务暂时繁忙（被限流），" + RETRY_LATER + said
-    if status in (401, 403):
-        return "模型服务的授权出了问题，这不是你的操作造成的，请联系提供邀请码的人。" + said
-    if status in (400, 404, 422):
-        return "模型服务拒绝了这次请求，任务停了下来。请把这条消息发给提供邀请码的人。" + said
-    return "模型服务出错，" + RETRY_LATER + said
-
-
 def model_app(config: dict, ledger: Ledger) -> FastAPI:
+    """The tenants' model endpoint, a pipe to the upstream: it swaps the tenant's
+    token for the upstream key, forwards the request unchanged, charges what the
+    upstream's receipt reports and answers 402 once an allowance is spent."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    slots = asyncio.Semaphore(config.get("concurrency", 2))
     tokens = {row["model_token"]: name for name, row in config["tenants"].items()}
+    upstream = config["upstream"]
+    url = upstream["base_url"].rstrip("/") + "/responses"
 
     def identify(request: Request) -> str | None:
         supplied = request.headers.get("authorization", "").removeprefix("Bearer ")
         return next((name for token, name in tokens.items() if secrets.compare_digest(supplied, token)), None)
+
+    def charge(tenant: str, usd: float | None) -> None:
+        if usd is None:
+            print(f"meter: {tenant} call ended without a usage receipt; not charged", flush=True)
+        else:
+            ledger.charge(tenant, usd)
 
     @app.get("/healthz")
     async def health():
@@ -318,114 +174,58 @@ def model_app(config: dict, ledger: Ledger) -> FastAPI:
         tenant = identify(request)
         if tenant is None:
             return JSONResponse({"error": {"message": "需要试用授权。"}}, 401)
+        if refusal := ledger.refusal(tenant):
+            return JSONResponse({"error": {"code": "trial_budget_exhausted", "message": refusal}}, 402)
         try:
-            raw = await bounded_body(request, MAX_BODY)
+            body = await bounded_body(request, MAX_BODY)
         except ValueError:
-            return JSONResponse({"error": {"message": f"这次请求超过 {MAX_BODY // 1024 // 1024} MB，模型服务收不下，任务停了下来。"
-                                                      "通常是对话里放进了很大的文件或图片：请新建一个项目继续，"
-                                                      "大文件放在项目目录里让 Argus 只读需要的部分。"}}, 413)
+            return JSONResponse({"error": {"message": f"这次请求超过模型中转单次 {MAX_BODY // 1024 // 1024} MB 的上限，没有发出。"}}, 413)
+        client = httpx.AsyncClient(timeout=httpx.Timeout(1800, connect=15), follow_redirects=False, trust_env=False)
         try:
-            payload = json.loads(raw)
-            if not isinstance(payload, dict):
-                raise ValueError
-            if payload.get("model") != MODEL:
-                return JSONResponse({"error": {"message": f"试用版只提供 {MODEL} 模型，这次请求用的是 "
-                                                          f"{payload.get('model')!r}。请联系提供邀请码的人。"}}, 400)
-            requested = payload.get("max_output_tokens")
-            if requested is not None and (type(requested) is not int or requested <= 0):
-                raise ValueError
-            tools = payload.get("tools", [])
-            if not isinstance(tools, list) or any(not isinstance(tool, dict) for tool in tools):
-                raise ValueError
-        except (ValueError, TypeError):
-            return JSONResponse({"error": {"message": "模型请求的格式不对，任务停了下来。请把这条消息发给提供邀请码的人。"}}, 400)
-        was_streaming = payload.get("stream", False)
-        payload.update(stream=True, store=False, background=False)
-        payload.pop("previous_response_id", None)
-        refusal, dropped = admit(payload, priced_by_usage=bool(config.get("upstream")))
-        if dropped:
-            print(f"meter: {tenant} request without {', '.join(sorted(dropped))}", flush=True)
-        if refusal:
-            print(f"meter: {tenant} refused: {refusal}", flush=True)
-            return JSONResponse({"error": {"message": f"请求里有试用版无法计费的内容（{refusal}，例如网址形式的图片或文件），"
-                                                      "任务停了下来。请把文件保存到项目目录，再让 Argus 打开它。"}}, 400)
-        await slots.acquire()
-        reservation = None
-        client = None
-        upstream = None
-        handed_off = False
-        try:
-            reservation = ledger.reserve(tenant, min(MAX_RESERVATION, (len(raw) + 4096) * INPUT_CEILING
-                                                     + (requested or DEFAULT_OUTPUT) * OUTPUT_CEILING))
-            url, headers, charge = upstream_request(config)
-            client = httpx.AsyncClient(timeout=httpx.Timeout(1800, connect=15), follow_redirects=False, trust_env=False)
-            upstream = await client.send(client.build_request("POST", url,
-                                                             headers=headers, json=payload), stream=True)
-            if upstream.status_code != 200:
-                status = upstream.status_code
-                detail = (await upstream.aread()).decode(errors="replace")
-                ledger.settle(reservation, 0 if status in (400, 401, 403, 404, 413, 422, 429) else None)
-                reservation = None
-                await upstream.aclose()
-                upstream = None
-                print(f"meter: {tenant} upstream {status}: {detail[:300]}", flush=True)
-                return JSONResponse({"error": {"message": provider_error(status, detail), "code": "provider_unavailable"}}, status)
-            handed_off = True
-        except QuotaExceeded as exc:
-            return JSONResponse({"error": {"code": "trial_budget_exhausted", "message": str(exc)}}, 402)
+            key = Path(upstream["token_file"]).read_text().strip()
+            reply = await client.send(client.build_request("POST", url, content=body, headers={
+                "Authorization": "Bearer " + key,
+                "Content-Type": request.headers.get("content-type", "application/json")}), stream=True)
         except Exception as exc:
+            await client.aclose()
             print(f"meter: {tenant} upstream unreachable: {type(exc).__name__}: {exc}", flush=True)
-            return JSONResponse({"error": {"message": f"连不上模型服务（{type(exc).__name__}），" + RETRY_LATER}}, 502)
-        finally:
-            if not handed_off:
-                try:
-                    if reservation:  # no answer from upstream, so nothing it could bill
-                        ledger.settle(reservation, 0)
-                finally:
-                    slots.release()
-                    if upstream:
-                        await upstream.aclose()
-                    if client:
-                        await client.aclose()
-
-        async def stream():
-            charged = None
+            return JSONResponse({"error": {"message": f"计量连不上模型中转：{type(exc).__name__}: {exc}"}}, 502)
+        kind = reply.headers.get("content-type", "application/json")
+        if not kind.startswith("text/event-stream"):
             try:
-                async for line in upstream.aiter_lines():
-                    if line.startswith("data:"):
+                content = await reply.aread()
+            finally:
+                await client.aclose()
+            if reply.status_code != 200:
+                print(f"meter: {tenant} upstream {reply.status_code}: {content[:300].decode(errors='replace')}", flush=True)
+            else:
+                try:
+                    usd = token_cost(json.loads(content))
+                except ValueError:
+                    usd = None
+                charge(tenant, usd)
+            return Response(content, reply.status_code, media_type=kind)
+
+        async def relay():
+            usd = None
+            try:
+                async for line in reply.aiter_lines():
+                    if usd is None and line.startswith("data:") and '"usage"' in line:
                         try:
                             event = json.loads(line[5:])
-                            if event.get("type") in ("response.completed", "response.incomplete", "response.failed"):
-                                charged = charge(event)
                         except ValueError:
-                            pass
+                            event = None
+                        if isinstance(event, dict) and event.get("type") in RECEIPTS:
+                            usd = token_cost(event.get("response"))
                     yield (line + "\n").encode()
-            except Exception as exc:
-                print(f"meter: {tenant} stream broke: {type(exc).__name__}: {exc}", flush=True)
-                raise
             finally:
-                if charged is None:
-                    print(f"meter: {tenant} call ended without a usage receipt; charged an estimate", flush=True)
-                    charged = interrupted_cost(len(raw))
                 try:
-                    ledger.settle(reservation, charged)
+                    charge(tenant, usd)
                 finally:
-                    slots.release()
-                    await upstream.aclose()
                     await client.aclose()
 
-        if was_streaming:
-            return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
-        final = None
-        async for line in stream():
-            if line.startswith(b"data:"):
-                try:
-                    event = json.loads(line[5:])
-                    if event.get("type") in ("response.completed", "response.incomplete"):
-                        final = event["response"]
-                except ValueError:
-                    pass
-        return JSONResponse(final or {"error": {"message": "模型没有返回完整结果，" + RETRY_LATER}}, 200 if final else 502)
+        return StreamingResponse(relay(), reply.status_code, media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-store"})
 
     return app
 
@@ -759,7 +559,6 @@ def main():
 
         meter_lock = open(config["ledger"] + ".lock", "a")
         fcntl.flock(meter_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        ledger.recover()
     app = model_app(config, ledger) if args.mode == "meter" else portal_app(config, ledger)
     uvicorn.run(app, host="127.0.0.1", port=args.port or 18871, uds=args.uds, access_log=False, proxy_headers=False)
 
