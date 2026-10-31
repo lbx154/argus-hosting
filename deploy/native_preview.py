@@ -72,10 +72,12 @@ class QuotaExceeded(Exception):
 
 
 class Ledger:
-    def __init__(self, path: Path, *, total_usd: float = 50, user_usd: float = 10):
+    def __init__(self, path: Path, *, total_usd: float = 50, user_usd: float = 10, allowances: dict[str, float] | None = None):
         self.path = path
         self.total = round(total_usd * MICRO)
         self.user = round(user_usd * MICRO)
+        # An invitation may carry its own allowance (its tenant's user_usd in preview.json); the rest share user_usd.
+        self.allowances = {tenant: round(float(usd) * MICRO) for tenant, usd in (allowances or {}).items()}
         with closing(sqlite3.connect(path)) as db:
             db.executescript("""
                 PRAGMA journal_mode=WAL;
@@ -111,21 +113,22 @@ class Ledger:
             # left is still admitted for what is left: it settles at its real
             # cost, which can overdraw by at most that one call. Nothing is
             # admitted once less than MIN_ADMIT remains.
-            if refusal := self.refusal(total, used, amount):
+            limit = self.allowances.get(tenant, self.user)
+            if refusal := self.refusal(limit, total, used, amount):
                 db.rollback()
                 raise QuotaExceeded(refusal)
-            amount = min(amount, self.total - total, self.user - used)
+            amount = min(amount, self.total - total, limit - used)
             identity = secrets.token_hex(16)
             db.execute("INSERT INTO charges VALUES(?,?,?,?,?)", (identity, tenant, amount, "reserved", time.time()))
             db.commit()
             return identity
 
-    def refusal(self, total: int, used: int, amount: int = MIN_ADMIT) -> str:
+    def refusal(self, limit: int, total: int, used: int, amount: int = MIN_ADMIT) -> str:
         """Why a call reserving ``amount`` is not admitted ("" if it is): the meter's 402 and the page's notice."""
-        if min(self.total - total, self.user - used) >= min(amount, MIN_ADMIT):
+        if min(self.total - total, limit - used) >= min(amount, MIN_ADMIT):
             return ""
-        whose = (f"这一版全站共 {self.total / MICRO:g} 美元的额度" if self.total - total < self.user - used
-                 else f"这个邀请码的 {self.user / MICRO:g} 美元")
+        whose = (f"这一版全站共 {self.total / MICRO:g} 美元的额度" if self.total - total < limit - used
+                 else f"这个邀请码的 {limit / MICRO:g} 美元")
         return f"试用额度已用完：{whose}已经用完，任务已暂停，已有文件都保留着。需要继续请联系提供邀请码的人加额度。"
 
     def settle(self, identity: str, usd: float | None) -> None:
@@ -143,11 +146,12 @@ class Ledger:
         with closing(sqlite3.connect(self.path)) as db:
             used = db.execute("SELECT COALESCE(SUM(amount),0) FROM charges WHERE tenant=?", (tenant,)).fetchone()[0]
             total = db.execute("SELECT COALESCE(SUM(amount),0) FROM charges").fetchone()[0]
-        return {"model": MODEL, "limit_usd": self.user / MICRO, "used_usd": used / MICRO,
-                "remaining_usd": max(0, self.user - used) / MICRO,
+        limit = self.allowances.get(tenant, self.user)
+        return {"model": MODEL, "limit_usd": limit / MICRO, "used_usd": used / MICRO,
+                "remaining_usd": max(0, limit - used) / MICRO,
                 "total_limit_usd": self.total / MICRO,
                 "total_remaining_usd": max(0, self.total - total) / MICRO, "concurrency": 2,
-                "exhausted": self.refusal(total, used)}
+                "exhausted": self.refusal(limit, total, used)}
 
 
 def provider_cost(event: dict) -> float | None:
@@ -742,7 +746,8 @@ def main():
     parser.add_argument("--uds", type=str)
     args = parser.parse_args()
     config = load_config(args.config)
-    ledger = Ledger(Path(config["ledger"]), total_usd=config["total_usd"], user_usd=config["user_usd"])
+    ledger = Ledger(Path(config["ledger"]), total_usd=config["total_usd"], user_usd=config["user_usd"],
+                    allowances={tenant: row["user_usd"] for tenant, row in config["tenants"].items() if "user_usd" in row})
     meter_lock = None
     if args.mode == "meter":
         import fcntl
