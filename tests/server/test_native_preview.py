@@ -163,6 +163,7 @@ def test_sandbox_has_no_host_network_home_or_cross_tenant_mount(config, tmp_path
     config['tenants']['alice']['directory'] = str(tmp_path / 'alice')
     command = sandbox_command(config, 'alice', ['/bin/true'])
     assert '--unshare-all' in command and '--share-net' not in command
+    assert command[command.index('NODE_USE_ENV_PROXY') + 1] == '1'  # Node's fetch takes the egress proxy too
     assert '--proc' in command and '--cap-drop' in command
     assert str(tmp_path / 'alice') in command and str(tmp_path / 'bob') not in command
     assert str(Path.home()) not in command
