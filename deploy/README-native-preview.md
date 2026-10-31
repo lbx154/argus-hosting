@@ -60,6 +60,28 @@ ports 80/443, rejecting private networks and metadata endpoints. Shell tools
 that use the configured HTTP/HTTPS proxies can access public internet resources.
 Tools needing direct sockets are unavailable.
 
+An invitation whose `tenants` row has `"docker": true` gets the host's Docker
+at `/tenant/run/docker.sock` (`DOCKER_HOST` is set) through `native_docker.py`,
+the `argus-NAME-docker` service. Ordinary use works: build, run, exec, attach,
+logs, GPUs, compose. Refused is what reaches the host or another invitation:
+privileged containers, capabilities beyond ptrace and network administration,
+devices, host namespaces and ports, host paths (only `/tenant`, `/tmp` and
+`/dev/shm`, as subpaths of a per-invitation volume Docker resolves itself, and
+`/usr` read-only), others' containers, networks and volumes, swarm, plugins and
+prune. An invitation names images only under `argus-tenant-NAME/`: `docker build
+-t app` makes `argus-tenant-NAME/app`, which `app` then finds; other images it
+uses are those a registry serves (pulled, with a digest), never one built on the
+host by anyone else, and there is no push. Builds use the classic builder
+(`DOCKER_BUILDKIT=0`): BuildKit's requests cannot be checked one at a time.
+Each build pulls its `FROM` afresh, so a `FROM` of a local image fails; use a
+multi-stage Dockerfile. Still open: the classic builder fetches `ADD http://…`
+(also from a base image's `ONBUILD`) on the host's own network, 127.0.0.1
+included; only a builder off that network, which takes a Docker daemon of the
+invitations' own, closes it. Each container is held to preview.json `limits`
+(`memory_gb`, `cpus`, `tasks`); containers run outside the invitation's
+service, on a bridge network of its own that, unlike the invitation itself, can
+reach private networks.
+
 The user services request 8 GiB memory, one CPU and 512 task limits per runtime.
 Some user managers have no delegated resource controllers. An independent
 host-side watchdog always samples aggregate process-tree RSS and thread counts
@@ -172,3 +194,19 @@ names with Secure, Path=/ and no Domain; only the new names are accepted.
 **Existing users of both versions must enter their invitation once again.**
 Their workspaces, invitations and balances remain intact. DNS, tunnel changes
 and production rollout are operator actions, separate from this source change.
+
+### Skills tenants offer to the store
+
+A JS root also runs `argus-NAME-contribute.timer`. Every 30 seconds
+`contribute.py` turns each tenant's offer of a team skill
+(`state/contributions/<name>.json`) into a pull request to
+Argus-AiTeam/argus-verticals, and writes its address, or why the offer was
+refused, back into that file. It runs as the operator, with the operator's gh
+login, from the clone `<root>/verticals`, whose working tree it resets on every
+offer: fork the store once (`gh repo fork Argus-AiTeam/argus-verticals
+--clone=false`), then `gh repo clone <you>/argus-verticals <root>/verticals`,
+which names the fork `origin` and the store `upstream`. Add `--dry-run` to the
+service's command to commit a waiting offer in the clone without pushing,
+opening or answering anything. systemd stops a run still going after 10
+minutes, stuck on GitHub say; the next one answers what it left. A skill
+reaches the store only when its maintainers merge the pull request.
