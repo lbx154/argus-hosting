@@ -181,24 +181,29 @@ def token_cost(event: dict) -> float | None:
     return quote.cost_usd if quote.status == "priced" else None
 
 
+BILLED_TOOLS = ("function", "custom", "web_search")
+
+
 def admit(payload: dict, *, priced_by_usage: bool) -> tuple[str, set[str]]:
     """Make a request billable or say why it cannot be.
 
     The reservation is bounded by the request's bytes, so content those bytes
     carry is admissible when the upstream bills it in its reported usage:
-    inline (data:) images and files. Remote media and hosted tools are billed
-    outside that usage and are refused or dropped; item references cannot be
-    resolved with ``store=False`` and are dropped. Copilot's receipts cover
-    text and function tools only, so without a usage-priced upstream media is
-    refused. Returns the refusal reason ("" to proceed) and what was dropped."""
+    inline (data:) images and files. Web search is kept: what it read comes back
+    in the reported usage, so a team can look things up. Remote media and other
+    hosted tools are billed outside that usage and are refused or dropped; item
+    references cannot be resolved with ``store=False`` and are dropped. Copilot's
+    receipts cover text, function tools and web search only, so without a
+    usage-priced upstream media is refused. Returns the refusal reason ("" to
+    proceed) and what was dropped."""
     dropped: set[str] = set()
     tools = payload.get("tools") or []
-    kept = [tool for tool in tools if tool.get("type") in ("function", "custom")]
+    kept = [tool for tool in tools if tool.get("type") in BILLED_TOOLS]
     dropped.update(f"tool:{tool.get('type')}" for tool in tools if tool not in kept)
     if tools:
         payload["tools"] = kept
         choice = payload.get("tool_choice")
-        if isinstance(choice, dict) and choice.get("type") not in (None, "function", "custom"):
+        if isinstance(choice, dict) and choice.get("type") not in (None, *BILLED_TOOLS):
             payload.pop("tool_choice")
 
     def walk(value):

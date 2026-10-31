@@ -14,7 +14,7 @@ from pathlib import Path
 # `codex login status`; without it the team daemon refuses to start.
 CODEX_CONFIG = '''model = "gpt-6.1-sol"
 model_provider = "meter"
-web_search = "disabled"
+web_search = "live"
 model_auto_compact_token_limit = 300000
 
 [model_providers.meter]

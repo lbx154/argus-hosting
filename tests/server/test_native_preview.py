@@ -574,7 +574,7 @@ def test_launch_restarts_into_and_out_of_a_storage_pause(tmp_path, monkeypatch, 
     assert (read_storage_pause(directory / 'state') is None) is paused
 
 
-def test_admit_keeps_billable_media_and_drops_what_it_cannot_bill():
+def test_admit_keeps_billable_media_and_web_search_and_drops_what_it_cannot_bill():
     payload = {'model': MODEL, 'tools': [{'type': 'function', 'name': 'f'}, {'type': 'web_search'}],
                'tool_choice': {'type': 'web_search'},
                'input': [{'type': 'item_reference', 'id': 'r1'},
@@ -582,9 +582,12 @@ def test_admit_keeps_billable_media_and_drops_what_it_cannot_bill():
                                                       {'type': 'input_image', 'image_url': 'data:image/png;base64,AAAA'}]}]}
     refusal, dropped = admit(payload, priced_by_usage=True)
     assert refusal == ''
-    assert dropped == {'tool:web_search', 'item_reference'}
-    assert [tool['type'] for tool in payload['tools']] == ['function']
-    assert 'tool_choice' not in payload
+    assert dropped == {'item_reference'}
+    assert [tool['type'] for tool in payload['tools']] == ['function', 'web_search']
+    assert payload['tool_choice'] == {'type': 'web_search'}
+    hosted = {'tools': [{'type': 'code_interpreter'}, {'type': 'web_search'}], 'tool_choice': {'type': 'code_interpreter'}}
+    assert admit(hosted, priced_by_usage=True) == ('', {'tool:code_interpreter'})
+    assert hosted == {'tools': [{'type': 'web_search'}]}
     assert len(payload['input']) == 1 and payload['input'][0]['content'][1]['type'] == 'input_image'
     remote = {'input': [{'role': 'user', 'content': [{'type': 'input_image', 'image_url': 'https://x/y.png'}]}]}
     assert admit(remote, priced_by_usage=True)[0] == 'input_image without inline data'
@@ -610,7 +613,7 @@ def test_meter_forwards_a_subagent_request_with_hosted_tools_to_a_priced_upstrea
         'model': MODEL, 'max_output_tokens': 64, 'tools': [{'type': 'function', 'name': 'task'}, {'type': 'web_search'}],
         'input': [{'type': 'item_reference', 'id': 'x'}, {'role': 'user', 'content': [{'type': 'input_text', 'text': 'review'}]}]})
     assert r.status_code == 200
-    assert [tool['type'] for tool in sent[0]['tools']] == ['function']
+    assert [tool['type'] for tool in sent[0]['tools']] == ['function', 'web_search']
     assert all(item.get('type') != 'item_reference' for item in sent[0]['input'])
 
 
