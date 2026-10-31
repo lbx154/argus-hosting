@@ -14,7 +14,7 @@ from pathlib import Path
 # `codex login status`; without it the team daemon refuses to start.
 CODEX_CONFIG = '''model = "gpt-6.1-sol"
 model_provider = "meter"
-web_search = "disabled"
+web_search = "live"
 model_auto_compact_token_limit = 300000
 
 [model_providers.meter]
@@ -41,17 +41,16 @@ def initialize(args) -> dict:
         return json.loads(path.read_text())
     config = {'model': 'gpt-6.1-sol', 'revision': args.revision, 'source': str(source), 'hosting_source': str(hosting_source),
               'venv': str(args.venv.resolve()), 'python_runtime': str(args.python_runtime.resolve()),
-              'node_runtime': str(args.node_runtime.resolve()), 'copilot_home': str(Path.home() / '.copilot'),
+              'node_runtime': str(args.node_runtime.resolve()),
               'ledger': str(root / 'usage.sqlite3'),
               'meter_runtime': str(root / 'meter'), 'total_usd': args.total_usd, 'user_usd': args.user_usd,
-              'concurrency': args.concurrency, 'name': args.name, 'port': args.port, 'title': args.title,
+              'name': args.name, 'port': args.port, 'title': args.title,
               'runtime': args.runtime, 'agent': args.agent,
-              'relay_secret': secrets.token_hex(32), 'tenants': {}}
+              'relay_secret': secrets.token_hex(32), 'tenants': {},
+              'upstream': {'base_url': args.upstream_base_url, 'token_file': str(args.upstream_token_file.resolve())}}
     for key in ('copilot_package', 'codex_package', 'argus_package'):
         if value := getattr(args, key):
             config[key] = str(value.resolve())
-    if args.upstream_base_url:
-        config['upstream'] = {'base_url': args.upstream_base_url, 'token_file': str(args.upstream_token_file.resolve())}
     (root / 'meter').mkdir(mode=0o700)
     for n in range(1, args.tenants + 1):
         name = f'trial{n}'
@@ -171,13 +170,10 @@ def main():
     parser.add_argument('--tenants', type=int, default=5)
     parser.add_argument('--user-usd', type=float, default=10)
     parser.add_argument('--total-usd', type=float, default=50)
-    parser.add_argument('--concurrency', type=int, default=2, help='simultaneous upstream model requests')
-    parser.add_argument('--upstream-base-url', help='OpenAI-compatible Responses endpoint instead of the Copilot login')
-    parser.add_argument('--upstream-token-file', type=Path, help='file holding the upstream key (kept outside Git)')
+    parser.add_argument('--upstream-base-url', required=True, help='OpenAI-compatible Responses endpoint the meter forwards to')
+    parser.add_argument('--upstream-token-file', type=Path, required=True, help='file holding the upstream key (kept outside Git)')
     parser.add_argument('--install-services', action='store_true')
     args = parser.parse_args()
-    if bool(args.upstream_base_url) != bool(args.upstream_token_file):
-        parser.error('--upstream-base-url and --upstream-token-file go together')
     for needed, flag in ((args.agent == 'copilot', 'copilot_package'), (args.agent == 'codex', 'codex_package'),
                          (args.runtime == 'js', 'argus_package')):
         if needed and not getattr(args, flag):
