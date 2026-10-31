@@ -12,8 +12,14 @@ from pathlib import Path
 # to 127.0.0.1:9011, with that tenant's own token (ARGUS_METER_TOKEN).
 # requires_openai_auth = false tells Argus's readiness check not to run
 # `codex login status`; without it the team daemon refuses to start.
+# Codex sends gpt-6.1-sol's tools in the Responses Lite form, which leaves out hosted web search, and
+# its standalone search calls an endpoint only OpenAI serves. This catalog is Codex's own entry for
+# the model with Lite off, so the meter's upstream gets the web_search tool. It is copied into the
+# Codex package: the one place both the tenant's sandbox and Argus's agent sandbox can read.
+CATALOG = Path(__file__).with_name('codex-models.json')
 CODEX_CONFIG = '''model = "gpt-6.1-sol"
 model_provider = "meter"
+model_catalog_json = "{catalog}"
 web_search = "live"
 model_auto_compact_token_limit = 300000
 
@@ -52,6 +58,9 @@ def initialize(args) -> dict:
         if value := getattr(args, key):
             config[key] = str(value.resolve())
     (root / 'meter').mkdir(mode=0o700)
+    if args.agent == 'codex':
+        catalog = Path(config['codex_package']) / 'argus-models.json'
+        shutil.copyfile(CATALOG, catalog)
     for n in range(1, args.tenants + 1):
         name = f'trial{n}'
         directory = root / name
@@ -63,7 +72,7 @@ def initialize(args) -> dict:
         if args.agent == 'codex':
             (directory / 'bin/codex').symlink_to(Path(config['codex_package']) / 'bin/codex.js')
             (directory / 'home/.codex').mkdir(mode=0o700)
-            (directory / 'home/.codex/config.toml').write_text(CODEX_CONFIG)
+            (directory / 'home/.codex/config.toml').write_text(CODEX_CONFIG.format(catalog=catalog))
         else:
             (directory / 'bin/copilot').symlink_to(args.node_runtime.resolve() / 'lib/node_modules/@github/copilot/npm-loader.js')
         (directory / 'state/identity.md').write_text(
