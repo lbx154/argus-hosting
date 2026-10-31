@@ -54,3 +54,25 @@ def test_login_page_and_error_are_shared_and_preserve_literal_input(tmp_path, ru
         assert result.headers['location'] == '/'
         assert '__Host-argus_preview_session=' in result.headers['set-cookie']
         assert client.get('/trial/budget').json()['remaining_usd'] == 50
+
+
+@pytest.mark.parametrize('runtime', ['js', 'py'])
+@pytest.mark.parametrize('invite', ['邀请码：only-alice', 'only-alice\u200b'])
+def test_non_ascii_invites_return_the_error_page_without_authenticating(tmp_path, runtime, invite):
+    config = {'runtime': runtime, 'revision': 'non-ascii-page-test',
+              'tenants': {'alice': {'invite': 'only-alice'}}}
+    ledger = Ledger(tmp_path / 'ledger', total_usd=500, user_usd=50)
+    with TestClient(portal_app(config, ledger), base_url='https://trial.test') as client:
+        response = client.post('/login', data={'invite': invite}, follow_redirects=False)
+        assert response.status_code == 401
+        assert response.headers['cache-control'] == 'no-store'
+        assert 'set-cookie' not in response.headers
+        page = Page(response.text)
+        assert page.field()['value'] == invite
+        assert page.field()['aria-invalid'] == 'true'
+        assert page.field()['aria-describedby'] == 'invite-error invite-note'
+        assert '这个邀请码不对，请核对后再贴一次。' in page.text
+        assert client.get('/trial/budget').status_code == 401
+        valid = client.post('/login', data={'invite': 'only-alice'}, follow_redirects=False)
+        assert valid.status_code == 303
+        assert client.get('/trial/budget').json()['remaining_usd'] == 50

@@ -554,7 +554,7 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
             token = form.get("invite", [""])[0].strip()
         except (ValueError, UnicodeError):
             return JSONResponse({"detail": "邀请码格式不正确。"}, 400)
-        tenant = next((name for invite, name in invites.items() if secrets.compare_digest(token, invite)), None)
+        tenant = next((name for invite, name in invites.items() if secrets.compare_digest(token.encode("utf-8"), invite.encode("utf-8"))), None)
         if tenant is None:
             return HTMLResponse(login_html(invite=token, error=True), 401, headers={"Cache-Control": "no-store"})
         response = RedirectResponse("/", 303)
