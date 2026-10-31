@@ -60,6 +60,28 @@ ports 80/443, rejecting private networks and metadata endpoints. Shell tools
 that use the configured HTTP/HTTPS proxies can access public internet resources.
 Tools needing direct sockets are unavailable.
 
+An invitation whose `tenants` row has `"docker": true` gets the host's Docker
+at `/tenant/run/docker.sock` (`DOCKER_HOST` is set) through `native_docker.py`,
+the `argus-NAME-docker` service. Ordinary use works: build, run, exec, attach,
+logs, GPUs, compose. Refused is what reaches the host or another invitation:
+privileged containers, capabilities beyond ptrace and network administration,
+devices, host namespaces and ports, host paths (only `/tenant`, `/tmp` and
+`/dev/shm`, as subpaths of a per-invitation volume Docker resolves itself, and
+`/usr` read-only), others' containers, networks and volumes, swarm, plugins and
+prune. An invitation names images only under `argus-tenant-NAME/`: `docker build
+-t app` makes `argus-tenant-NAME/app`, which `app` then finds; other images it
+uses are those a registry serves (pulled, with a digest), never one built on the
+host by anyone else, and there is no push. Builds use the classic builder
+(`DOCKER_BUILDKIT=0`): BuildKit's requests cannot be checked one at a time.
+Each build pulls its `FROM` afresh, so a `FROM` of a local image fails; use a
+multi-stage Dockerfile. Still open: the classic builder fetches `ADD http://…`
+(also from a base image's `ONBUILD`) on the host's own network, 127.0.0.1
+included; only a builder off that network, which takes a Docker daemon of the
+invitations' own, closes it. Each container is held to preview.json `limits`
+(`memory_gb`, `cpus`, `tasks`); containers run outside the invitation's
+service, on a bridge network of its own that, unlike the invitation itself, can
+reach private networks.
+
 The user services request 8 GiB memory, one CPU and 512 task limits per runtime.
 Some user managers have no delegated resource controllers. An independent
 host-side watchdog always samples aggregate process-tree RSS and thread counts

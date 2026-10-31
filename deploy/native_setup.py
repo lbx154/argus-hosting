@@ -100,6 +100,8 @@ def install_services(config: dict, root: Path) -> None:
     if config.get('runtime') == 'js':
         commands[job] = [python, str(source / 'deploy/contribute.py'), 'run', '--config', str(root / 'preview.json'),
                          '--repo', str(root / 'verticals'), '--gh', shutil.which('gh') or 'gh']
+    if any(row.get('docker') for row in config['tenants'].values()):
+        commands[prefix + 'docker'] = [python, str(source / 'deploy/native_docker.py'), '--config', str(root / 'preview.json')]
     for name, command in commands.items():
         # systemd command lines have their own quoting and percent expansion.
         executable = ' '.join(json.dumps(arg.replace('%', '%%')) for arg in command)
