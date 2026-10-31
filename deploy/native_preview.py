@@ -45,9 +45,9 @@ MICRO = 1_000_000
 # UTF-8 bytes (an upper bound on text tokens), framing and the requested output.
 INPUT_CEILING = 5.0 / MICRO
 OUTPUT_CEILING = 20.0 / MICRO
-# Only protects the meter's memory. Codex compacts a conversation long before
-# its requests get near this; a 2 MB cap here used to fail long tasks outright.
-MAX_BODY = 64 * 1024 * 1024
+# The model relay's own limit (copilot-codex-relay MAX_REQUEST_BYTES): it drops
+# a larger request unread, so it is refused here, before anything is reserved.
+MAX_BODY = 16 * 1024 * 1024
 DEFAULT_OUTPUT = 32768  # reserved for when a request names no output cap
 # A reservation holds money only while its call runs and settles at the real
 # cost, which for a long conversation is mostly cached input. Capping it keeps
@@ -111,19 +111,22 @@ class Ledger:
             # left is still admitted for what is left: it settles at its real
             # cost, which can overdraw by at most that one call. Nothing is
             # admitted once less than MIN_ADMIT remains.
-            left = min(self.total - total, self.user - used)
-            if left < min(amount, MIN_ADMIT):
+            if refusal := self.refusal(total, used, amount):
                 db.rollback()
-                if self.total - total < self.user - used:
-                    raise QuotaExceeded(f"试用额度已用完：这一版全站共 {self.total / MICRO:g} 美元的额度已经用完，"
-                                        "任务已暂停，已有文件都保留着。需要继续请联系提供邀请码的人加额度。")
-                raise QuotaExceeded(f"试用额度已用完：这个邀请码的 {self.user / MICRO:g} 美元已经用完，"
-                                    "任务已暂停，已有文件都保留着。需要继续请联系提供邀请码的人加额度。")
-            amount = min(amount, left)
+                raise QuotaExceeded(refusal)
+            amount = min(amount, self.total - total, self.user - used)
             identity = secrets.token_hex(16)
             db.execute("INSERT INTO charges VALUES(?,?,?,?,?)", (identity, tenant, amount, "reserved", time.time()))
             db.commit()
             return identity
+
+    def refusal(self, total: int, used: int, amount: int = MIN_ADMIT) -> str:
+        """Why a call reserving ``amount`` is not admitted ("" if it is): the meter's 402 and the page's notice."""
+        if min(self.total - total, self.user - used) >= min(amount, MIN_ADMIT):
+            return ""
+        whose = (f"这一版全站共 {self.total / MICRO:g} 美元的额度" if self.total - total < self.user - used
+                 else f"这个邀请码的 {self.user / MICRO:g} 美元")
+        return f"试用额度已用完：{whose}已经用完，任务已暂停，已有文件都保留着。需要继续请联系提供邀请码的人加额度。"
 
     def settle(self, identity: str, usd: float | None) -> None:
         if usd is not None and (not math.isfinite(usd) or usd < 0):
@@ -143,7 +146,8 @@ class Ledger:
         return {"model": MODEL, "limit_usd": self.user / MICRO, "used_usd": used / MICRO,
                 "remaining_usd": max(0, self.user - used) / MICRO,
                 "total_limit_usd": self.total / MICRO,
-                "total_remaining_usd": max(0, self.total - total) / MICRO, "concurrency": 2}
+                "total_remaining_usd": max(0, self.total - total) / MICRO, "concurrency": 2,
+                "exhausted": self.refusal(total, used)}
 
 
 def provider_cost(event: dict) -> float | None:
@@ -340,14 +344,12 @@ def model_app(config: dict, ledger: Ledger) -> FastAPI:
         reservation = None
         client = None
         upstream = None
-        submitted = False
         handed_off = False
         try:
             reservation = ledger.reserve(tenant, min(MAX_RESERVATION, (len(raw) + 4096) * INPUT_CEILING
                                                      + (requested or DEFAULT_OUTPUT) * OUTPUT_CEILING))
             url, headers, charge = upstream_request(config)
             client = httpx.AsyncClient(timeout=httpx.Timeout(1800, connect=15), follow_redirects=False, trust_env=False)
-            submitted = True
             upstream = await client.send(client.build_request("POST", url,
                                                              headers=headers, json=payload), stream=True)
             if upstream.status_code != 200:
@@ -368,8 +370,8 @@ def model_app(config: dict, ledger: Ledger) -> FastAPI:
         finally:
             if not handed_off:
                 try:
-                    if reservation:
-                        ledger.settle(reservation, interrupted_cost(len(raw)) if submitted else 0)
+                    if reservation:  # no answer from upstream, so nothing it could bill
+                        ledger.settle(reservation, 0)
                 finally:
                     slots.release()
                     if upstream:
@@ -570,7 +572,7 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
     async def quota_script():
         from fastapi.responses import Response
 
-        return Response("""(()=>{async function update(){const r=await fetch('/trial/budget');if(r.status===401){location.assign('/login');return}if(!r.ok)return;const b=await r.json();const host=document.querySelector('.composer-runtime');if(!host)return;let node=document.getElementById('trial-quota');if(!node){node=document.createElement('span');node.id='trial-quota';node.style.cssText='font-size:11px;color:#2069d1';host.append(node)}node.textContent='试用余额 $'+b.remaining_usd.toFixed(2)+' / $'+b.limit_usd.toFixed(2);node.title='全站剩余 $'+b.total_remaining_usd.toFixed(2)+'；模型 '+b.model}setInterval(update,8000);setTimeout(update,1200)})();""", media_type="text/javascript")
+        return Response("""(()=>{async function update(){const r=await fetch('/trial/budget');if(r.status===401){location.assign('/login');return}if(!r.ok)return;const b=await r.json();const host=document.querySelector('.composer-runtime');if(!host)return;let node=document.getElementById('trial-quota');if(!node){node=document.createElement('span');node.id='trial-quota';node.style.fontSize='11px';host.append(node)}node.style.color=b.exhausted?'#c0392b':'#2069d1';node.textContent=b.exhausted||'试用余额 $'+b.remaining_usd.toFixed(2)+' / $'+b.limit_usd.toFixed(2);node.title='全站剩余 $'+b.total_remaining_usd.toFixed(2)+'；模型 '+b.model}setInterval(update,8000);setTimeout(update,1200)})();""", media_type="text/javascript")
 
     @app.get("/trial-transport.js")
     async def transport_script():

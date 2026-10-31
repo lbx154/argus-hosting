@@ -82,6 +82,13 @@ class Router:
 
     async def http(self, scope, receive, send):
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+        query = scope.get("query_string", b"").decode("latin-1")
+        # Over http a login can only fail (its cookie is Secure), after the invitation went out in
+        # clear. cf-visitor names the browser's scheme; x-forwarded-proto may name a later hop.
+        visitor = re.search(r'"scheme":\s*"(\w+)"', headers.get("cf-visitor", ""))
+        if (visitor[1] if visitor else headers.get("x-forwarded-proto")) == "http":
+            path = scope.get("raw_path", scope["path"].encode()).decode("latin-1")
+            return await redirect(send, f"https://{headers.get('host', '')}{path}" + ("?" + query if query else ""), 301)
         preview, tenant = preview_host(headers.get("host", ""), self.preview_domain)
         if preview:
             if tenant is None or "js" not in self.versions:
@@ -93,8 +100,11 @@ class Router:
             version, inner, known = "js", scope.get("raw_path", scope["path"].encode()).decode("ascii"), "preview"
         else:
             version, inner, known = self.place(scope, headers)
+        # The portals' own pages, not a tenant's API answers and files (all under /api/) or previews.
+        own = not preview and not (inner or "").startswith("/api/")
+        if own:
+            send = framed(send)
         named = known == "path"
-        query = scope.get("query_string", b"").decode("latin-1")
         navigation = headers.get("sec-fetch-mode") == "navigate" or (
             "sec-fetch-mode" not in headers and "text/html" in headers.get("accept", ""))
         if not preview and scope["path"] == "/" and known != "referer":
@@ -141,7 +151,7 @@ class Router:
                 out.append((key, value))
             if named and navigation:
                 out.append(("set-cookie", f"{LAST}={version}; Path=/; Max-Age=2592000; Secure; HttpOnly; SameSite=Lax"))
-            if not preview and response.headers.get("content-type", "").startswith("text/html") and response.status_code == 200:
+            if own and response.headers.get("content-type", "").startswith("text/html") and response.status_code == 200:
                 page = await response.aread()
                 page = inject(page, SHIM % json.dumps("/" + version))
                 out = [(k, v) for k, v in out if k != "content-length"] + [("content-length", str(len(page)))]
@@ -242,6 +252,15 @@ def inject(page: bytes, script: str) -> bytes:
     return (text[:at] + script + text[at:]).encode()
 
 
+def framed(send):
+    """Let no other site frame a page: a preview, though same-site, could clickjack a signed-in cockpit."""
+    async def framed_send(message):
+        if message["type"] == "http.response.start":
+            message = {**message, "headers": [*message["headers"], (b"content-security-policy", b"frame-ancestors 'self'")]}
+        await send(message)
+    return framed_send
+
+
 def encode(headers: list[tuple[str, str]]) -> list[tuple[bytes, bytes]]:
     return [(k.encode("latin-1"), v.encode("latin-1")) for k, v in headers]
 
@@ -252,8 +271,8 @@ async def respond(send, status: int, body: bytes, kind: str):
     await send({"type": "http.response.body", "body": body})
 
 
-async def redirect(send, location: str):
-    await send({"type": "http.response.start", "status": 302,
+async def redirect(send, location: str, status: int = 302):
+    await send({"type": "http.response.start", "status": status,
                 "headers": encode([("location", location), ("content-length", "0"), ("cache-control", "no-store")])})
     await send({"type": "http.response.body", "body": b""})
 
@@ -268,7 +287,8 @@ def main():
     args = parser.parse_args()
     versions = {name: int(port) for name, _, port in (item.partition("=") for item in args.version)}
     uvicorn.run(Router(versions, args.user_usd, args.preview_domain), host="127.0.0.1", port=args.port, lifespan="off",
-                access_log=False, proxy_headers=False, ws_max_size=16 * 1024 * 1024)
+                access_log=False, proxy_headers=False, ws_max_size=16 * 1024 * 1024,
+                headers=[("strict-transport-security", "max-age=31536000")])  # browsers heed it over https only
 
 
 if __name__ == "__main__":
