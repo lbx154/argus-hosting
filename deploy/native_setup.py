@@ -93,6 +93,8 @@ def install_services(config: dict, root: Path) -> None:
     }
     for name in config['tenants']:
         commands[prefix + name] = [python, str(source / 'deploy/native_runtime.py'), 'launch', '--config', str(root / 'preview.json'), '--tenant', name]
+    if any(row.get('docker') for row in config['tenants'].values()):
+        commands[prefix + 'docker'] = [python, str(source / 'deploy/native_docker.py'), '--config', str(root / 'preview.json')]
     for name, command in commands.items():
         # systemd command lines have their own quoting and percent expansion.
         executable = ' '.join(json.dumps(arg.replace('%', '%%')) for arg in command)

@@ -79,6 +79,10 @@ def sandbox_command(config: dict, tenant: str, command: list[str] | None = None)
             "COPILOT_PROVIDER_BEARER_TOKEN": row["model_token"],
             "COPILOT_PROVIDER_MAX_PROMPT_TOKENS": "128000", "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS": "16384",
         })
+    if row.get("docker"):
+        # The host's Docker through deploy/native_docker.py, with its classic
+        # builder: BuildKit's requests cannot be checked one by one.
+        env.update({"DOCKER_HOST": "unix:///tenant/run/docker.sock", "DOCKER_BUILDKIT": "0"})
     if config.get("runtime") == "js":
         env.update({"ARGUS_HOME": "/tenant/state", "ARGUS_WEB_TOKEN": row["web_token"],
                     "ARGUS_TRIAL_PACKAGE": config["argus_package"]})
