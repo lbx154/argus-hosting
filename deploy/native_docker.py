@@ -5,12 +5,19 @@ A tenant whose preview.json row has ``"docker": true`` finds Docker at
 logs, GPUs (``--gpus``), bridge networks, compose. Refused is what would hand it
 the host or another tenant: privileged containers, extra capabilities, devices,
 host namespaces and ports, host paths, other tenants' containers, networks and
-volumes (they carry the label argus.tenant), swarm, plugins and prune.
+volumes (they carry the label argus.tenant), images built here by anyone else,
+swarm, plugins and prune.
+
+A tenant names images only in its own namespace, argus-tenant-NAME/: ``docker
+build -t app`` makes argus-tenant-NAME/app, which ``app`` then finds. Every
+other image it uses is one a registry serves to anyone; a build pulls its FROM
+afresh, so no FROM reads an image built on this host.
 
 Each connection carries one request, read whole and sent on in the canonical
 form it was checked in: decoded and normalized path, re-encoded query, rebuilt
-headers, re-serialized JSON. Nothing a client sends after it reaches Docker,
-except the raw stream of an attach or exec Docker has taken over.
+headers, re-serialized JSON, each object named by the ID it was checked as.
+Nothing a client sends after it reaches Docker, except the raw stream of an
+attach or exec Docker has taken over.
 
 Host paths are mounted as subpaths of a per-tenant volume bound to the tenant's
 directory: Docker resolves those itself at every start and refuses one a symlink
@@ -25,6 +32,7 @@ import json
 import os
 import posixpath
 import re
+import resource
 from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, unquote, urlencode
@@ -35,7 +43,7 @@ except ImportError:  # Executed as deploy/native_docker.py.
     from native_egress import refuse
 
 LABEL = "argus.tenant"
-RESERVED = "argus-tenant-"  # the gate's own volume and network for each tenant
+RESERVED = "argus-tenant-"  # each tenant's volume, network and image namespace
 DOCKER = "/var/run/docker.sock"
 # Docker's default capabilities, plus tracing and network administration,
 # which act only inside the container's own namespaces.
@@ -62,20 +70,23 @@ HOST_RULES = (  # HostConfig fields a tenant may not set, and why
      "log drivers send from the host's network"),
     ("VolumeDriver", lambda driver: driver not in (None, "", "local"), "volume plugins"),
     ("OomScoreAdj", lambda score: (score or 0) < 0, "the host's OOM killer would spare it"),
-    ("Ulimits", lambda limits: any(field(limit, "Name") == "rtprio" for limit in limits or ()),
+    ("Ulimits", lambda limits: any(field(limit, "Name").upper() == "RTPRIO" for limit in limits or ()),
      "real-time priority starves the host"),
 )
 CONTAINER, EXEC, NETWORK, VOLUME = (rf"(?P<{kind}>[^/]+)" for kind in ("container", "exec", "network", "volume"))
 ROUTES = [(methods.split(), re.compile(path), rule) for methods, path, rule in (
-    # Everything else is refused. A named object must be this tenant's (images are shared).
+    # Everything else is refused. A named object must be this tenant's, an
+    # image its own or a registry's; a name it removes is in its namespace.
     ("GET HEAD", r"/_ping", None),
-    ("GET", r"/version|/info|/images/json|/images/search|/images/get|/images/.+/(json|history|get)"
-            r"|/distribution/.+/json", None),
-    ("POST", r"/auth|/images/.+/push", None),
+    ("GET", r"/version|/info|/images/search|/distribution/.+/json", None),
+    ("POST", r"/auth", None),
+    ("GET", r"/images/json", "images"),
+    ("GET", r"/images/get", "save"),
+    ("GET", r"/images/(?P<image>.+)/(json|history|get)", None),
     ("POST", r"/images/create", "pull"),
     ("POST", r"/build", "build"),
     ("POST", r"/images/(?P<image>.+)/tag", "tag"),
-    ("DELETE", r"/images/(?P<image>.+)", "untag"),
+    ("DELETE", r"/images/(?P<name>.+)", None),
     ("POST", r"/commit", "commit"),
     ("GET", r"/events|/containers/json|/networks|/volumes", "listing"),
     ("POST", r"/containers/create", "create"),
@@ -96,9 +107,13 @@ ROUTES = [(methods.split(), re.compile(path), rule) for methods, path, rule in (
 JSON_BODIES = {"create", "update", "exec", "connect", "network_create", "volume_create", "commit"}
 HIJACKED = re.compile(r"/containers/[^/]+/attach(/ws)?|/exec/[^/]+/start")
 TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+# Dropped from what a client sends, content-type with them: Docker would read
+# a form body over the checked query; a checked body goes as JSON.
 HOP = {"connection", "keep-alive", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
-       "content-length", "host", "expect"}
-BODY_LIMIT = 16 * 1024**2
+       "content-length", "host", "expect", "content-type"}
+BODY_LIMIT = 1024**2  # a create is a few kB; parsing one holds up every tenant
+DEADLINE = 60  # seconds for a request's head and checked body
+CONNECTIONS = 512  # at once, per tenant
 
 
 class Refused(Exception):
@@ -140,10 +155,6 @@ def one(query: list, key: str) -> str | None:
 
 def put(query: list, key: str, value: str) -> None:
     query[:] = [(name, old) for name, old in query if name != key] + [(key, value)]
-
-
-def truthy(value: str | None) -> bool:
-    return (value or "").strip().lower() not in ("", "0", "no", "false", "none")
 
 
 def within(path: str, root: str) -> bool:
@@ -247,6 +258,24 @@ async def whole(reader, size: int | str) -> bytes:
     return bytes(data)
 
 
+async def receive(reader) -> tuple[Request, bytes | None]:
+    """A request's head and, when it is checked or Docker may take the
+    connection over after it, its whole body."""
+    request, content = Request(*await read_head(reader)), None
+    if request.rule in JSON_BODIES or request.hijacked:
+        content = await whole(reader, request.size)
+        if content or request.rule in JSON_BODIES:
+            request.json = json.loads(content or b"{}", object_pairs_hook=unique) or {}
+    return request, content
+
+
+async def gone(reader) -> None:
+    """Return once the client has left, dropping whatever it sends meanwhile."""
+    with contextlib.suppress(OSError):
+        while await reader.read(65536):
+            pass
+
+
 async def pipe(reader, writer) -> None:
     """Copy until EOF, then pass the EOF on: stdin closed by ``docker run -i``
     still lets the container's output come back."""
@@ -267,9 +296,6 @@ class Request:
         self.method, target, protocol = start.split(" ")
         if protocol not in ("HTTP/1.1", "HTTP/1.0") or not target.startswith("/"):
             raise Refused(400, "malformed request line")
-        if any(value.split(";")[0].strip().lower() == "application/x-www-form-urlencoded"
-               for name, value in headers if name == "content-type"):
-            raise Refused(400, "Docker would read a form body over the query")
         raw, _, query = target.partition("?")
         path = posixpath.normpath("/" + unquote(raw, errors="strict").lstrip("/"))
         version = re.match(r"/v[0-9.]+(?=/)", path)
@@ -277,28 +303,29 @@ class Request:
         self.path = path[len(self.version):]
         self.query = parse_qsl(query, keep_blank_values=True)
         self.headers, self.size = headers, framing(headers)
-        self.json = None
+        self.hijacked = bool(HIJACKED.fullmatch(self.path))
+        self.json = self.answer = None  # the body as checked; a reply made here instead of Docker's
         for methods, pattern, rule in ROUTES:
             if self.method in methods and (match := pattern.fullmatch(self.path)):
                 self.match, self.rule = match, rule
                 return
         raise Refused(403, f"{self.method} {self.path} is not available in a workspace")
 
+    def target(self) -> str:
+        target = quote(self.version + self.path, safe="/:@!$&'()*+,;=-._~")
+        return f"{target}?{urlencode(self.query)}" if self.query else target
+
     def head(self, content: bytes | None) -> bytes:
         """The request line and headers as Docker gets them: a checked body
-        goes with its length, any other with the client's own framing."""
-        target = quote(self.version + self.path, safe="/:@!$&'()*+,;=-._~")
-        if self.query:
-            target += "?" + urlencode(self.query)
+        goes as JSON with its length, any other with the client's own framing."""
         # Docker closes the connection after one answer; one it takes over
         # (attach, exec) it upgrades regardless.
         connection = "Connection: close"
         upgrade = [value for name, value in self.headers if name == "upgrade"]
-        if HIJACKED.fullmatch(self.path) and upgrade:
+        if self.hijacked and upgrade:
             connection = f"Connection: Upgrade, close\r\nUpgrade: {upgrade[0]}"
         headers = [(name, value) for name, value in self.headers if name not in HOP]
         if self.json is not None:
-            headers = [(name, value) for name, value in headers if name != "content-type"]
             headers.append(("content-type", "application/json"))
         if content is not None:
             headers.append(("content-length", str(len(content))))
@@ -306,7 +333,7 @@ class Request:
             headers.append(("transfer-encoding", "chunked"))
         elif self.size:
             headers.append(("content-length", str(self.size)))
-        lines = [f"{self.method} {target} HTTP/1.1", "Host: docker", connection,
+        lines = [f"{self.method} {self.target()} HTTP/1.1", "Host: docker", connection,
                  *(f"{name}: {value}" for name, value in headers)]
         return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
 
@@ -316,8 +343,9 @@ class Gate:
 
     def __init__(self, name: str, directory: str | Path, limits: dict | None, docker: str = DOCKER):
         self.name, self.directory, self.limits, self.docker = name, str(directory), limits or {}, docker
-        # The volume holding the tenant's directory, and its default network.
+        # The volume holding the tenant's directory, its default network, and its images' namespace.
         self.plumbing = RESERVED + name
+        self.connections = 0
 
     async def call(self, method: str, path: str, payload=None) -> tuple[int, object]:
         """Ask Docker directly; HTTP/1.0 so the answer is never chunked."""
@@ -347,18 +375,39 @@ class Gate:
         if found == 200 and kind == "exec":
             await self.owned("container", data["ContainerID"])
             return data["ID"]
+        if found == 200 and kind == "container":
+            # Docker gives a container its image's labels too: a label the
+            # image carries says nothing of who made the container.
+            _, image = await self.call("GET", f"/images/{quote(data['Image'], safe=':')}/json")
+            found = 403 if labels(image or {}).get(LABEL) == self.name else found
         if found != 200 or labels(data).get(LABEL) != self.name:
             raise Refused(status, f"No such {kind}: {ref}")
         return data.get("Id") or data["Name"]
 
-    async def image(self, reference: str) -> str | None:
-        """Who built image ``reference``: a tenant, "" for anyone else, None if there is none."""
-        status, data = await self.call("GET", f"/images/{quote(reference, safe='/:@')}/json")
-        return labels(data).get(LABEL, "") if status == 200 else None
+    def mine(self, name: str) -> str:
+        """Image ``name`` in this tenant's namespace (the Docker CLI spells
+        ``app`` docker.io/library/app when it tags or commits)."""
+        name = name.removeprefix("docker.io/").removeprefix("library/")
+        return name if name.startswith(self.plumbing + "/") else f"{self.plumbing}/{name}"
 
-    async def may_name(self, reference: str) -> None:
-        if await self.image(reference) not in (None, self.name):
-            raise Refused(403, f"{reference} names a shared image; a workspace names only images it built")
+    def visible(self, image: dict) -> bool:
+        """Whether an image is this tenant's own or one a registry serves (it has a digest from there)."""
+        return bool(image.get("RepoDigests")) or any(tag.startswith(self.plumbing + "/")
+                                                     for tag in image.get("RepoTags") or ())
+
+    async def image(self, reference: str, status: int = 404) -> str:
+        """Image ``reference`` as this tenant sees it: its own, named in its
+        namespace, else one a registry serves. Docker gets it by name only when
+        the name is one of its tags, which no tenant can point at an image it
+        may not use; otherwise by ID, which no name or ID prefix can shadow."""
+        for name in (self.mine(reference), reference):
+            found, data = await self.call("GET", f"/images/{quote(name, safe='/:@')}/json")
+            if found == 200 and self.visible(data):
+                return name if {name, f"{name}:latest"} & set(data.get("RepoTags") or ()) else data["Id"]
+        if found == 200:
+            raise Refused(403, f"{reference} was built on this host by someone else; a workspace uses its own "
+                               "images and registries'")
+        raise Refused(status, f"No such image: {reference}")
 
     def claim(self, body: dict) -> None:
         if (field(body, "Name") or "").startswith(RESERVED):
@@ -366,18 +415,33 @@ class Gate:
         body["Labels"] = {**(field(body, "Labels") or {}), LABEL: self.name}
 
     async def network(self, name: str) -> str:
-        """The network a container or build joins: Docker's default is replaced
-        by this tenant's own bridge, which no other tenant's containers share."""
+        """The ID of the network a container or build joins (or none, or a
+        container's): Docker's default is replaced by this tenant's own bridge,
+        which no other tenant's containers share."""
         if name in ("", "default", "bridge", self.plumbing):
-            await self.call("POST", "/networks/create", {"Name": self.plumbing})  # 409 once it exists
-            return self.plumbing
+            await self.call("POST", "/networks/create", {"Name": self.plumbing, "Labels": {LABEL: self.name}})
+            name = self.plumbing  # 409 above once it exists
         if name.casefold() == "host":
             raise Refused(403, "the host's network is not available")
         if name.startswith("container:"):
-            await self.owned("container", name.removeprefix("container:"), 403)
-        elif name != "none":
-            await self.owned("network", name, 403)
-        return name
+            return "container:" + await self.owned("container", name.removeprefix("container:"), 403)
+        return name if name == "none" else await self.owned("network", name, 403)
+
+    async def endpoint(self, settings: dict, network: str) -> dict:
+        """Settings for joining ``network``: Docker joins the NetworkID they
+        name over any network name, and links the containers they name."""
+        field(settings, "NetworkID")
+        settings["NetworkID"] = network
+        settings["Links"] = [await self.pin(link, link=True) for link in field(settings, "Links") or ()]
+        return settings
+
+    async def pin(self, spec: str, link: bool = False) -> str:
+        """``container[:rest]`` (VolumesFrom, Links) with this tenant's container
+        by ID; a link keeps the name it was given as its alias."""
+        ref, _, rest = spec.partition(":")
+        rest = rest or (ref if link else "")
+        container = await self.owned("container", ref, 403)
+        return f"{container}:{rest}" if rest else container
 
     async def volume(self, name: str) -> None:
         """A named volume a container mounts: this tenant's, or a new one made its own."""
@@ -414,9 +478,9 @@ class Gate:
             if mode.casefold() == "host":
                 raise Refused(403, f"{key}: the host's namespaces are not available")
             if mode.startswith("container:"):
-                await self.owned("container", mode.removeprefix("container:"), 403)
-        for ref in [*(field(host, "Links") or ()), *(field(host, "VolumesFrom") or ())]:
-            await self.owned("container", ref.split(":")[0], 403)
+                host[key] = "container:" + await self.owned("container", mode.removeprefix("container:"), 403)
+        host["Links"] = [await self.pin(link, link=True) for link in field(host, "Links") or ()]
+        host["VolumesFrom"] = [await self.pin(spec) for spec in field(host, "VolumesFrom") or ()]
         binds, mounts = [], []
         for spec in field(host, "Binds") or ():
             source, *rest = spec.split(":")
@@ -438,16 +502,23 @@ class Gate:
                     raise Refused(403, "volume driver options can mount any host path")
                 if source := field(mount, "Source"):
                     await self.volume(source)
-            elif kind not in ("tmpfs", "image"):
+            elif kind == "image":
+                mount["Source"] = await self.image(field(mount, "Source") or "", 403)
+            elif kind != "tmpfs":
                 raise Refused(403, f"{kind} mounts are not available")
             mounts.append(mount)
         host["Binds"], host["Mounts"] = binds, mounts
 
     async def check(self, request: Request) -> None:
+        """Put in the path what Docker is to act on (this tenant's object by ID,
+        an image it may use, a name in its namespace), then apply the route's rule."""
         for kind, ref in request.match.groupdict().items():
-            if kind != "image":  # images are shared
-                start, end = request.match.span(kind)
-                request.path = request.path[:start] + await self.owned(kind, ref) + request.path[end:]
+            if kind == "name":
+                ref = self.mine(ref)
+            else:
+                ref = await (self.image(ref) if kind == "image" else self.owned(kind, ref))
+            start, end = request.match.span(kind)
+            request.path = request.path[:start] + ref + request.path[end:]
         if request.rule:
             await getattr(self, request.rule)(request)
 
@@ -459,9 +530,12 @@ class Gate:
         await self.host_config(host)
         bound(host, self.limits, fill=True)
         host["NetworkMode"] = await self.network(field(host, "NetworkMode") or "")
-        endpoints = field(field(body, "NetworkingConfig") or {}, "EndpointsConfig") or {}
-        body["NetworkingConfig"] = {"EndpointsConfig": {
-            await self.network(name): endpoint for name, endpoint in endpoints.items()}}
+        endpoints = {}
+        for name, settings in (field(field(body, "NetworkingConfig") or {}, "EndpointsConfig") or {}).items():
+            network = await self.network(name)
+            endpoints[network] = await self.endpoint(settings or {}, network)
+        body["NetworkingConfig"] = {"EndpointsConfig": endpoints}
+        body["Image"] = await self.image(field(body, "Image") or "")
         body["Labels"] = {**(field(body, "Labels") or {}), LABEL: self.name}
 
     async def update(self, request: Request) -> None:
@@ -473,7 +547,10 @@ class Gate:
             raise Refused(403, "Privileged: a privileged exec owns the host")
 
     async def connect(self, request: Request) -> None:
-        await self.owned("container", field(request.json, "Container") or "")
+        body = request.json
+        body["Container"] = await self.owned("container", field(body, "Container") or "")
+        if settings := field(body, "EndpointConfig"):
+            body["EndpointConfig"] = await self.endpoint(settings, request.path.split("/")[2])  # the network's ID
 
     async def network_create(self, request: Request) -> None:
         body = request.json
@@ -496,9 +573,18 @@ class Gate:
         filters.setdefault("label", {})[f"{LABEL}={self.name}"] = True
         put(request.query, "filters", json.dumps(filters))
 
+    async def images(self, request: Request) -> None:
+        status, data = await self.call("GET", request.target())
+        request.answer = status, [image for image in data if self.visible(image)] if status == 200 else data
+
+    async def save(self, request: Request) -> None:
+        request.query = [(key, await self.image(value) if key == "names" else value) for key, value in request.query]
+
     async def pull(self, request: Request) -> None:
-        if one(request.query, "fromSrc") is not None:
-            raise Refused(403, "importing could replace a shared image's name; pull or build instead")
+        image = one(request.query, "fromImage") or ""
+        if not image or RESERVED in image:
+            raise Refused(403, "a workspace pulls from registries; importing, or pulling into a workspace's "
+                               "namespace, could replace another's image")
 
     async def build(self, request: Request) -> None:
         query = request.query
@@ -506,11 +592,17 @@ class Gate:
             raise Refused(403, "BuildKit's requests cannot be checked one by one; build with DOCKER_BUILDKIT=0")
         if one(query, "cgroupparent"):
             raise Refused(403, "cgroupparent: host cgroups")
-        for name, value in query:
-            if name == "t":
-                await self.may_name(value)
+        if one(query, "remote"):
+            raise Refused(403, "remote: Docker would fetch it from the host's network")
+        check_host({"Ulimits": json.loads(one(query, "ulimits") or "null")})
+        query[:] = [(key, self.mine(value) if key == "t" and value else value) for key, value in query]
+        # Each FROM is pulled from its registry, never read from an image built
+        # here, nor is any image named as a cache.
+        put(query, "pull", "1")
+        put(query, "cachefrom", "[]")
         put(query, "networkmode", await self.network(one(query, "networkmode") or ""))
-        put(query, "labels", json.dumps({**json.loads(one(query, "labels") or "{}"), LABEL: self.name}))
+        # Containers made from the image are not given the tenant's label by it (see owned).
+        put(query, "labels", json.dumps({**(json.loads(one(query, "labels") or "null") or {}), LABEL: ""}))
         resources = {"Memory": int(one(query, "memory") or 0), "CpuPeriod": int(one(query, "cpuperiod") or 100_000),
                      "CpuQuota": int(one(query, "cpuquota") or 0)}
         bound(resources, self.limits, fill=True)
@@ -518,41 +610,32 @@ class Gate:
             put(query, key.lower(), str(resources[key]))
 
     async def tag(self, request: Request) -> None:
-        repository, tag = one(request.query, "repo") or "", one(request.query, "tag")
-        await self.may_name(f"{repository}:{tag}" if tag else repository)
-
-    async def untag(self, request: Request) -> None:
-        if truthy(one(request.query, "force")):
-            raise Refused(403, "force would remove an image other containers use")
-        if await self.image(request.match["image"]) != self.name:
-            raise Refused(403, "a workspace removes only images it built")
+        put(request.query, "repo", self.mine(one(request.query, "repo") or ""))
 
     async def commit(self, request: Request) -> None:
         put(request.query, "container", await self.owned("container", one(request.query, "container") or ""))
         if repository := one(request.query, "repo"):
-            tag = one(request.query, "tag")
-            await self.may_name(f"{repository}:{tag}" if tag else repository)
-        request.json["Labels"] = {**(field(request.json, "Labels") or {}), LABEL: self.name}
+            put(request.query, "repo", self.mine(repository))
+        request.json["Labels"] = {**(field(request.json, "Labels") or {}), LABEL: ""}  # as in build
 
     async def handle(self, reader, writer) -> None:
-        upstream = upward = None
+        if self.connections >= CONNECTIONS:
+            refuse(writer, "503 Service Unavailable", "this workspace has too many Docker requests open")
+            writer.close()
+            return
+        self.connections += 1
+        upstream = watch = None
         answered = False
         try:
-            start, headers = await asyncio.wait_for(read_head(reader), 60)
-            try:
-                request = Request(start, headers)
-            except ValueError as exc:
-                raise Refused(400, f"malformed request: {exc}") from None
-            hijacked = HIJACKED.fullmatch(request.path)
-            content = None
-            if request.rule in JSON_BODIES or hijacked:
-                content = await whole(reader, request.size)
-            if request.rule in JSON_BODIES:
-                request.json = json.loads(content or b"{}", object_pairs_hook=unique) or {}
+            request, content = await asyncio.wait_for(receive(reader), DEADLINE)
             try:
                 await self.check(request)
             except (ValueError, TypeError, AttributeError, KeyError) as exc:
                 raise Refused(400, f"malformed request: {exc!r}") from None
+            if request.answer:
+                status, payload = request.answer
+                refuse(writer, f"{status} {HTTPStatus(status).phrase}", json.dumps(payload))
+                return
             if request.json is not None:
                 content = json.dumps(request.json).encode()
             other, upstream = await asyncio.open_unix_connection(self.docker)
@@ -565,27 +648,33 @@ class Gate:
                 if chunked:
                     upstream.write(b"0\r\n\r\n")
             await upstream.drain()
+            if not request.hijacked:
+                # The client has nothing more to say: once it leaves, so does
+                # Docker's answer, however quiet (docker events, logs -f, wait).
+                watch = asyncio.ensure_future(gone(reader))
+                watch.add_done_callback(lambda _: upstream.close())
             response = await other.readuntil(b"\r\n\r\n")
             writer.write(response)
             answered = True
             # Only once Docker has taken the connection over is the rest of it
             # a raw stream rather than requests.
             status = response.split(b" ", 2)[1]
-            if hijacked and (status == b"101" or b"\ncontent-type: application/vnd.docker." in response.lower()):
-                upward = asyncio.ensure_future(pipe(reader, upstream))
+            if request.hijacked and (status == b"101" or b"\ncontent-type: application/vnd.docker." in response.lower()):
+                watch = asyncio.ensure_future(pipe(reader, upstream))
             await pipe(other, writer)
         except Refused as exc:
             if not answered:
                 refuse(writer, f"{exc.status} {HTTPStatus(exc.status).phrase}", str(exc))
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        except ValueError as exc:  # a malformed request line, path or JSON body
             if not answered:
                 refuse(writer, "400 Bad Request", f"malformed request: {exc}")
         except (OSError, EOFError, asyncio.LimitOverrunError, TimeoutError) as exc:
             if not answered:
                 refuse(writer, "502 Bad Gateway", f"{type(exc).__name__}: {exc}")
         finally:
-            if upward:
-                upward.cancel()
+            self.connections -= 1
+            if watch:
+                watch.cancel()
             writer.close()
             if upstream:
                 upstream.close()
@@ -611,6 +700,8 @@ async def serve(config: dict, docker: str = DOCKER) -> None:
 
 
 if __name__ == "__main__":
+    # Every tenant's connections (up to CONNECTIONS each) share this process.
+    resource.setrlimit(resource.RLIMIT_NOFILE, (resource.getrlimit(resource.RLIMIT_NOFILE)[1],) * 2)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
     asyncio.run(serve(json.loads(parser.parse_args().config.read_text())))

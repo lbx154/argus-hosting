@@ -14,19 +14,28 @@ from deploy import native_docker
 from deploy.native_docker import LABEL, Gate, framing, read_head, whole
 
 MINE, BOBS = {LABEL: "alice"}, {LABEL: "bob"}
+# Images built by this tenant, pulled from a registry, built on the host by
+# someone else, and built by another tenant.
+OWN = {"Id": "sha256:1", "RepoTags": ["argus-tenant-alice/built:latest"], "RepoDigests": [], "Config": {"Labels": {LABEL: ""}}}
+PUBLIC = {"Id": "sha256:2", "RepoTags": ["shared:latest"], "RepoDigests": ["shared@sha256:d"], "Config": {"Labels": None}}
+PRIVATE = {"Id": "sha256:3", "RepoTags": ["private:latest"], "RepoDigests": [], "Config": {"Labels": None}}
+BOBS_IMAGE = {"Id": "sha256:4", "RepoTags": ["argus-tenant-bob/app:latest"], "RepoDigests": [], "Config": {"Labels": {LABEL: ""}}}
 OBJECTS = {
-    "/containers/mine/json": {"Id": "c-mine", "Config": {"Labels": MINE}},
-    "/containers/bob-box/json": {"Id": "c-bob", "Config": {"Labels": BOBS}},
+    "/containers/mine/json": {"Id": "c-mine", "Image": "sha256:2", "Config": {"Labels": MINE}},
+    "/containers/bob-box/json": {"Id": "c-bob", "Image": "sha256:2", "Config": {"Labels": BOBS}},
     "/exec/e-mine/json": {"ID": "e-mine", "ContainerID": "c-mine"},
     "/exec/e-bob/json": {"ID": "e-bob", "ContainerID": "c-bob"},
-    "/containers/c-mine/json": {"Id": "c-mine", "Config": {"Labels": MINE}},
-    "/containers/c-bob/json": {"Id": "c-bob", "Config": {"Labels": BOBS}},
+    "/containers/c-mine/json": {"Id": "c-mine", "Image": "sha256:2", "Config": {"Labels": MINE}},
+    "/containers/c-bob/json": {"Id": "c-bob", "Image": "sha256:2", "Config": {"Labels": BOBS}},
     "/networks/mine-net": {"Id": "n-mine", "Labels": MINE},
     "/networks/bob-net": {"Id": "n-bob", "Labels": BOBS},
+    "/networks/argus-tenant-alice": {"Id": "n-alice", "Labels": MINE},
     "/volumes/mine-data": {"Name": "mine-data", "Labels": MINE},
     "/volumes/bob-data": {"Name": "bob-data", "Labels": BOBS},
-    "/images/built/json": {"Id": "sha256:1", "Config": {"Labels": MINE}},
-    "/images/shared/json": {"Id": "sha256:2", "Config": {"Labels": None}},
+    "/images/argus-tenant-alice/built/json": OWN, "/images/sha256:1/json": OWN, "/images/ab/json": OWN,
+    "/images/shared/json": PUBLIC, "/images/sha256:2/json": PUBLIC,
+    "/images/private/json": PRIVATE, "/images/sha256:3/json": PRIVATE,
+    "/images/argus-tenant-bob/app/json": BOBS_IMAGE,
 }
 
 
@@ -34,7 +43,9 @@ class FakeDocker:
     """Docker's API as far as the gate uses it. Inspections answer from
     OBJECTS (else 404); a request asking to upgrade is taken over and echoes
     stdin in upper case, then says BYE; everything else is 200. It records
-    every request, and with ``linger`` whatever arrives after its answer."""
+    every request, and with ``linger`` whatever arrives after its answer.
+    ``run`` leaves to asyncio.run whatever connections are still open at the
+    end, so a gate that holds on to one fails a test instead of hanging it."""
 
     def __init__(self, directory: Path):
         self.directory = directory
@@ -47,7 +58,7 @@ class FakeDocker:
         path = re.sub(r"^/v[0-9.]+", "", url.path)
         content = await whole(reader, framing(headers))
         payload = json.loads(content) if dict(headers).get("content-type") == "application/json" and content else content
-        self.requests.append({"method": method, "path": path, "query": dict(parse_qsl(url.query)),
+        self.requests.append({"method": method, "path": path, "query": dict(parse_qsl(url.query)), "target": target,
                               "headers": dict(headers), "body": payload, "protocol": protocol})
         if "upgrade" in dict(headers) and (method, path) not in self.answers:
             writer.write(b"HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\n"
@@ -86,9 +97,13 @@ class FakeDocker:
     def run(self, steps):
         async def main():
             gate = Gate("alice", self.directory, {"memory_gb": 4, "cpus": 2, "tasks": 100}, "docker.sock")
-            async with await asyncio.start_unix_server(self.handle, "docker.sock"), \
-                    await asyncio.start_unix_server(gate.handle, "gate.sock"):
+            servers = [await asyncio.start_unix_server(self.handle, "docker.sock"),
+                       await asyncio.start_unix_server(gate.handle, "gate.sock")]
+            try:
                 return await steps()
+            finally:
+                for server in servers:
+                    server.close()
         return asyncio.run(main())
 
     def send(self, *requests: bytes) -> list[bytes]:
@@ -157,6 +172,8 @@ ESCAPES = [
     {"HostConfig": {"VolumeDriver": "sshfs"}},
     {"HostConfig": {"OomScoreAdj": -1000}},
     {"HostConfig": {"Ulimits": [{"Name": "rtprio", "Soft": 99, "Hard": 99}]}},
+    {"HostConfig": {"Ulimits": [{"Name": "RTPRIO", "Soft": 99, "Hard": 99}]}},  # Docker upper-cases it
+    {"HostConfig": {"Ulimits": [{"Name": "rtpr\u0131o", "Soft": 99, "Hard": 99}]}},  # dotless i, too
     *({"HostConfig": {mode: "host"}} for mode in
       ("NetworkMode", "PidMode", "IpcMode", "UTSMode", "UsernsMode", "CgroupnsMode")),
     {"HostConfig": {"NetworkMode": "HOST"}},
@@ -177,6 +194,8 @@ ESCAPES = [
     {"HostConfig": {"Mounts": [{"Type": "volume", "Target": "/x", "VolumeOptions": {
         "DriverConfig": {"Name": "local", "Options": {"type": "none", "o": "bind", "device": "/"}}}}]}},
     {"HostConfig": {"Mounts": [{"Type": "npipe", "Source": "x", "Target": "/x"}]}},
+    {"HostConfig": {"Mounts": [{"Type": "image", "Source": "private", "Target": "/x"}]}},
+    {"Image": "private"}, {"Image": "sha256:3"}, {"Image": "argus-tenant-bob/app"},
 ]
 
 
@@ -194,8 +213,12 @@ def test_a_container_that_would_reach_the_host_or_another_tenant_is_refused(dock
     "POST /v1.55/networks/prune", "POST /v1.55/build/prune", "POST /v1.55/session", "POST /grpc",
     "GET /v1.55/system/df", "POST /v1.55/images/load", "PUT /v1.55/volumes/mine-data",
     "POST /v1.55/build?networkmode=host", "POST /v1.55/build?cgroupparent=/x", "POST /v1.55/build?version=2",
-    "POST /v1.55/build?t=shared", "POST /v1.55/build?t=new&t=shared", "POST /v1.55/images/create?fromSrc=-&repo=x",
-    "POST /v1.55/images/built/tag?repo=shared", "DELETE /v1.55/images/shared", "DELETE /v1.55/images/built?force=1",
+    "POST /v1.55/build?remote=http://127.0.0.1:39917/secret.txt",
+    "POST /v1.55/build?ulimits=%5B%7B%22Name%22%3A%22rtprio%22%2C%22Soft%22%3A99%2C%22Hard%22%3A99%7D%5D",
+    "POST /v1.55/images/create?fromSrc=-&repo=x", "POST /v1.55/images/create?fromSrc=http://127.0.0.1:1/x.tar",
+    "POST /v1.55/images/create?fromImage=argus-tenant-bob/app", "POST /v1.55/images/shared/push",
+    "GET /v1.55/images/private/json", "GET /v1.55/images/private/history", "GET /v1.55/images/private/get",
+    "GET /v1.55/images/get?names=shared&names=private", "POST /v1.55/images/private/tag?repo=mine",
     # other spellings of a refused endpoint
     "POST /v1.55//swarm/init", "POST /v1.55/./swarm/init", "POST /v1.55/x/../swarm/init", "POST /v1.55/%73warm/init",
     "POST /v1.55/SWARM/init", "POST /v1.55/swarm/init/", "post /v1.55/swarm/init", "POST /v1.55/containers%2Fprune",
@@ -214,7 +237,7 @@ def test_endpoints_that_reach_the_host_are_refused_however_spelled(docker, targe
 ])
 def test_every_spelling_of_an_endpoint_is_checked_and_sent_on_in_one_form(docker, path):
     refused, allowed = docker.send(request("POST", path, {"HostConfig": {"Privileged": True}}),
-                                   request("POST", path, {"Image": "alpine"}))
+                                   request("POST", path, {"Image": "shared"}))
     assert status(refused) == 403 and status(allowed) == 200
     [create] = docker.forwarded()
     assert create["path"] == "/containers/create"
@@ -238,10 +261,10 @@ def test_a_chunked_body_is_read_whole_before_it_is_checked(docker):
         return (b"POST /v1.55/containers/create HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
                 b"Transfer-Encoding: chunked\r\n\r\n" + b"".join(b"%x\r\n%s\r\n" % (len(p), p) for p in pieces)
                 + b"0\r\n\r\n")
-    refused, allowed = docker.send(chunked({"HostConfig": {"Privileged": True}}), chunked({"Image": "alpine"}))
+    refused, allowed = docker.send(chunked({"HostConfig": {"Privileged": True}}), chunked({"Image": "shared"}))
     assert status(refused) == 403 and status(allowed) == 200
     [create] = docker.forwarded()
-    assert create["body"]["Image"] == "alpine" and "content-length" in create["headers"]
+    assert create["body"]["Image"] == "shared" and "content-length" in create["headers"]
 
 
 @pytest.mark.parametrize("head", [
@@ -251,7 +274,6 @@ def test_a_chunked_body_is_read_whole_before_it_is_checked(docker):
     "Content-Length: 2\r\nContent-Length: 30",
     "Content-Length: +2",
     "Content-Length: 2\r\nX-Smuggle: a\nContent-Length: 30",
-    "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 2",
 ])
 def test_ambiguous_framing_is_refused(docker, head):
     [response] = docker.send(f"POST /v1.55/containers/create HTTP/1.1\r\nHost: x\r\n{head}\r\n\r\n{{}}".encode())
@@ -259,8 +281,30 @@ def test_ambiguous_framing_is_refused(docker, head):
     assert not docker.forwarded()
 
 
+@pytest.mark.parametrize("content_type", ["application/x-www-form-urlencoded",
+                                          "appl\u0130cation/x-www-form-urlencoded",  # Go lower-cases it to the same
+                                          "multipart/form-data; boundary=B"])
+def test_docker_never_reads_a_form_body_over_the_checked_query(docker, content_type):
+    body = b"t=shared&version=2&networkmode=host&repo=shared&fromSrc=-"
+    head = f"Content-Type: {content_type}\r\nContent-Length: {len(body)}".encode()
+    targets = ("/v1.55/build?t=app", "/v1.55/images/built/tag?repo=fresh", "/v1.55/images/create?fromImage=alpine")
+    docker.send(*(b"POST %s HTTP/1.1\r\nHost: x\r\n%s\r\n\r\n%s" % (target.encode(), head, body) for target in targets))
+    assert len(docker.forwarded()) == 3
+    for forwarded in docker.forwarded():
+        assert "content-type" not in forwarded["headers"]  # so Go parses no form, only the query
+    build, tag, _ = docker.forwarded()
+    assert build["query"]["t"] == "argus-tenant-alice/app" and tag["query"]["repo"] == "argus-tenant-alice/fresh"
+
+
+def test_a_checked_body_goes_as_json_whatever_type_the_client_named(docker):
+    docker.send(request("POST", "/v1.55/containers/create", {"Image": "shared"}),
+                b"POST /v1.55/containers/create HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\n"
+                b"Content-Length: 18\r\n\r\n{\"Image\":\"shared\"}")
+    assert [r["headers"]["content-type"] for r in docker.forwarded()] == ["application/json"] * 2
+
+
 def test_host_paths_become_subpaths_of_the_tenants_own_volume(docker):
-    body = {"HostConfig": {
+    body = {"Image": "shared", "HostConfig": {
         "Binds": ["/tenant/workspace/data:/data:ro", "/tmp/t:/t", "/dev/shm/s:/s:rw", "/usr/share:/u", "fresh:/n", "/anon"],
         "Mounts": [{"Type": "bind", "Source": "/tenant", "Target": "/all"}, {"Type": "tmpfs", "Target": "/scratch"},
                    {"Type": "volume", "Source": "mine-data", "Target": "/m"}]}}
@@ -286,20 +330,23 @@ def test_host_paths_become_subpaths_of_the_tenants_own_volume(docker):
 def test_a_symlink_is_never_followed_out_of_the_tenant(docker, tmp_path, monkeypatch):
     (tmp_path / "outside").mkdir()
     (docker.directory / "workspace/link").symlink_to(tmp_path / "outside")
-    responses = docker.send(request("POST", "/v1.55/containers/create", {"HostConfig": {"Binds": ["/tenant/workspace/link/new:/x"]}}))
+    responses = docker.send(request("POST", "/v1.55/containers/create", {
+        "Image": "shared", "HostConfig": {"Binds": ["/tenant/workspace/link/new:/x"]}}))
     # Docker gets the subpath, resolves it itself at every start, and refuses
     # one that leads outside; the gate created nothing through the link.
     assert status(responses[0]) == 200
     assert created(docker)["HostConfig"]["Mounts"][0]["VolumeOptions"]["Subpath"] == "workspace/link/new"
     assert not (tmp_path / "outside/new").exists()
     monkeypatch.setattr(native_docker.os.path, "realpath", lambda path: "/etc/shadow")
-    [response] = docker.send(request("POST", "/v1.55/containers/create", {"HostConfig": {"Binds": ["/usr/lib/x:/x"]}}))
+    [response] = docker.send(request("POST", "/v1.55/containers/create", {
+        "Image": "shared", "HostConfig": {"Binds": ["/usr/lib/x:/x"]}}))
     assert status(response) == 403
 
 
 def test_a_volume_that_does_not_hold_the_tenants_directory_is_not_used(docker):
     docker.answers["POST", "/volumes/create"] = (201, {"Name": "argus-tenant-alice", "Options": {"device": "/"}})
-    [response] = docker.send(request("POST", "/v1.55/containers/create", {"HostConfig": {"Binds": ["/tenant:/t"]}}))
+    [response] = docker.send(request("POST", "/v1.55/containers/create", {
+        "Image": "shared", "HostConfig": {"Binds": ["/tenant:/t"]}}))
     assert status(response) == 500
     assert not docker.forwarded()
 
@@ -323,13 +370,58 @@ def test_a_tenant_touches_only_its_own_containers_execs_networks_and_volumes(doc
     assert [r["path"] for r in docker.forwarded()] == [
         "/containers/c-mine/start", "/exec/e-mine/resize", "/networks/n-mine", "/volumes/mine-data",
         "/networks/n-mine/connect", "/commit"]
-    assert docker.forwarded()[-1]["query"]["container"] == "c-mine"
-    assert docker.forwarded()[-1]["body"]["Labels"] == MINE
+    connect, commit = docker.forwarded()[-2:]
+    assert connect["body"]["Container"] == "c-mine"
+    assert commit["query"] == {"container": "c-mine", "repo": "argus-tenant-alice/new"}
+    assert commit["body"]["Labels"] == {LABEL: ""}  # an image passes its labels on to containers
+
+
+def test_a_container_given_the_tenants_label_by_its_image_is_not_the_tenants(docker, monkeypatch):
+    # Docker gives a container its image's labels: an operator's container
+    # made from an image that carries this tenant's label carries it too.
+    monkeypatch.setitem(OBJECTS, "/images/sha256:9/json", {"Id": "sha256:9", "Config": {"Labels": MINE}})
+    monkeypatch.setitem(OBJECTS, "/containers/op/json", {"Id": "c-op", "Image": "sha256:9", "Config": {"Labels": MINE}})
+    responses = docker.send(request("POST", "/v1.55/containers/op/exec", {"Cmd": ["id"]}),
+                            request("GET", "/v1.55/containers/op/json"),
+                            request("POST", "/v1.55/containers/create", {"Image": "shared", "HostConfig": {
+                                "VolumesFrom": ["op"]}}))
+    assert [status(r) for r in responses] == [404, 404, 403]
+    assert not docker.forwarded()
+
+
+def test_objects_a_request_names_go_to_docker_by_the_id_checked(docker):
+    # Docker finds a container by ID, then name, then ID prefix: a name sent on
+    # after its check could, by then, find another's container.
+    docker.send(request("POST", "/v1.55/containers/create", {"Image": "shared", "HostConfig": {
+        "VolumesFrom": ["mine:ro", "mine"], "Links": ["mine", "mine:db"], "PidMode": "container:mine",
+        "IpcMode": "container:mine", "Cgroup": "container:mine", "NetworkMode": "container:mine"},
+        "NetworkingConfig": {"EndpointsConfig": {"mine-net": {"Links": ["mine:web"]}}}}),
+        request("POST", "/v1.55/containers/create", {"Image": "shared", "HostConfig": {"NetworkMode": "mine-net"}}))
+    first, second = (r["body"] for r in docker.forwarded())
+    host = first["HostConfig"]
+    assert host["VolumesFrom"] == ["c-mine:ro", "c-mine"]
+    assert host["Links"] == ["c-mine:mine", "c-mine:db"]
+    assert host["PidMode"] == host["IpcMode"] == host["Cgroup"] == host["NetworkMode"] == "container:c-mine"
+    assert first["NetworkingConfig"]["EndpointsConfig"]["n-mine"]["Links"] == ["c-mine:web"]
+    assert second["HostConfig"]["NetworkMode"] == "n-mine"
+
+
+def test_a_container_joins_only_the_networks_checked(docker):
+    # Docker joins the network an endpoint's NetworkID names over the one its key names.
+    docker.send(request("POST", "/v1.55/containers/create", {"Image": "shared", "HostConfig": {"NetworkMode": "mine-net"},
+                "NetworkingConfig": {"EndpointsConfig": {"mine-net": {"NetworkID": "bob-net", "Aliases": ["a"]}}}}),
+                request("POST", "/v1.55/networks/mine-net/connect", {"Container": "mine", "EndpointConfig": {
+                    "networkid": "bridge"}}))
+    create, connect = docker.forwarded()
+    assert create["body"]["NetworkingConfig"] == {"EndpointsConfig": {"n-mine": {
+        "NetworkID": "n-mine", "Aliases": ["a"], "Links": []}}}
+    assert connect["path"] == "/networks/n-mine/connect"
+    assert connect["body"] == {"Container": "c-mine", "EndpointConfig": {"NetworkID": "n-mine", "Links": []}}
 
 
 def test_new_objects_carry_the_tenant_label_and_lists_show_only_them(docker):
     responses = docker.send(
-        request("POST", "/v1.55/containers/create", {"Image": "alpine", "Labels": {LABEL: "bob", "app": "x"}}),
+        request("POST", "/v1.55/containers/create", {"Image": "shared", "Labels": {LABEL: "bob", "app": "x"}}),
         request("POST", "/v1.55/networks/create", {"Name": "n"}),
         request("POST", "/v1.55/volumes/create", {"Name": "v"}),
         request("GET", '/v1.55/containers/json?all=1&filters={"status":["running"],"label":["app=x"]}'),
@@ -365,12 +457,12 @@ def test_volumes_are_plain_local_volumes(docker, body):
 
 
 def test_containers_join_the_tenants_own_network_instead_of_the_shared_bridge(docker):
-    docker.send(request("POST", "/v1.55/containers/create", {
+    docker.send(request("POST", "/v1.55/containers/create", {"Image": "shared",
         "HostConfig": {"NetworkMode": "default"}, "NetworkingConfig": {"EndpointsConfig": {"default": {"Aliases": ["a"]}}}}))
     body = created(docker)
-    assert body["HostConfig"]["NetworkMode"] == "argus-tenant-alice"
-    assert body["NetworkingConfig"] == {"EndpointsConfig": {"argus-tenant-alice": {"Aliases": ["a"]}}}
-    assert {"Name": "argus-tenant-alice"} in [r["body"] for r in docker.requests if r["path"] == "/networks/create"]
+    assert body["HostConfig"]["NetworkMode"] == "n-alice"
+    assert body["NetworkingConfig"] == {"EndpointsConfig": {"n-alice": {"Aliases": ["a"], "NetworkID": "n-alice", "Links": []}}}
+    assert {"Name": "argus-tenant-alice", "Labels": MINE} in [r["body"] for r in docker.requests if r["path"] == "/networks/create"]
 
 
 @pytest.mark.parametrize("given, sent", [
@@ -380,7 +472,7 @@ def test_containers_join_the_tenants_own_network_instead_of_the_shared_bridge(do
     ({"memory": 1024**4, "CpuQuota": -1, "CpuPeriod": 50000}, {"Memory": 4 * 1024**3, "CpuQuota": 100000, "PidsLimit": 100}),
 ])
 def test_containers_get_the_tenants_resource_limits(docker, given, sent):
-    docker.send(request("POST", "/v1.55/containers/create", {"HostConfig": given}))
+    docker.send(request("POST", "/v1.55/containers/create", {"Image": "shared", "HostConfig": given}))
     host = created(docker)["HostConfig"]
     assert {key: host.get(key) for key in sent} == sent and ("CpuQuota" in sent) != ("NanoCpus" in host)
 
@@ -394,17 +486,48 @@ def test_updates_and_builds_stay_within_the_limits(docker):
     assert unchanged["body"] == {"Memory": 0, "NanoCpus": 0, "PidsLimit": None}
     assert capped["body"] == {"Memory": 4 * 1024**3, "NanoCpus": 2 * 10**9, "PidsLimit": 100}
     assert build["query"]["memory"] == str(4 * 1024**3) and build["query"]["cpuquota"] == "200000"
-    assert build["query"]["networkmode"] == "argus-tenant-alice"
-    assert json.loads(build["query"]["labels"]) == {"a": "b", LABEL: "alice"}
+    assert build["query"]["networkmode"] == "n-alice"
+    # Its image does not give containers the tenant's label; its FROM is pulled
+    # afresh, never read from an image built on this host, nor is one a cache.
+    assert json.loads(build["query"]["labels"]) == {"a": "b", LABEL: ""}
+    assert build["query"]["pull"] == "1" and build["query"]["cachefrom"] == "[]"
 
 
-def test_images_the_tenant_built_can_be_renamed_and_removed(docker):
-    responses = docker.send(request("POST", "/v1.55/images/shared/tag?repo=built"),
-                            request("POST", "/v1.55/images/built/tag?repo=fresh&tag=1"),
-                            request("DELETE", "/v1.55/images/built"), request("POST", "/v1.55/images/create?fromImage=alpine"))
-    assert [status(r) for r in responses] == [200] * 4
-    assert [r["path"] for r in docker.forwarded()] == ["/images/shared/tag", "/images/built/tag", "/images/built",
-                                                       "/images/create"]
+def test_a_workspace_names_images_only_in_its_own_namespace(docker):
+    # Else it could take a name others would pull, and they would run its image.
+    responses = docker.send(
+        request("POST", "/v1.55/build?t=python:3.99-slim"), request("POST", "/v1.55/build?t=argus-tenant-alice/app"),
+        request("POST", "/v1.55/images/shared/tag?repo=ghcr.io/laude-institute/t-bench/base&tag=1"),
+        request("POST", "/v1.55/images/built/tag?repo=shared:anything&tag=v1"),  # Docker makes that shared:v1
+        request("POST", "/v1.55/commit?container=mine&repo=argus-tenant-bob/app&tag=9", {}),
+        request("DELETE", "/v1.55/images/shared?force=%1C"), request("DELETE", "/v1.55/images/built"))
+    assert [status(r) for r in responses] == [200] * 7
+    build, again, public, own, commit, untag, remove = docker.forwarded()
+    assert build["query"]["t"] == "argus-tenant-alice/python:3.99-slim" and again["query"]["t"] == "argus-tenant-alice/app"
+    assert (public["path"], public["query"]["repo"]) == ("/images/shared/tag", "argus-tenant-alice/ghcr.io/laude-institute/t-bench/base")
+    assert (own["path"], own["query"]["repo"]) == ("/images/argus-tenant-alice/built/tag", "argus-tenant-alice/shared:anything")
+    assert commit["query"]["repo"] == "argus-tenant-alice/argus-tenant-bob/app"
+    assert [untag["path"], remove["path"]] == ["/images/argus-tenant-alice/shared", "/images/argus-tenant-alice/built"]
+
+
+def test_a_workspace_uses_its_own_images_and_registries_but_none_built_here_by_others(docker):
+    responses = docker.send(*(request("POST", "/v1.55/containers/create", {"Image": image}) for image in
+                              ("built", "shared", "sha256:2", "ab", "nowhere", "private")),
+                            request("GET", "/v1.55/images/built/history"), request("GET", "/v1.55/images/get?names=shared&names=ab"))
+    # "nowhere" is 404, so the Docker CLI pulls it and tries again.
+    assert [status(r) for r in responses] == [200, 200, 200, 200, 404, 403, 200, 200]
+    *creates, history, save = docker.forwarded()
+    # By a name only where it is the image's own tag; by ID where a name or an ID prefix could find another.
+    assert [r["body"]["Image"] for r in creates] == ["argus-tenant-alice/built", "shared", "sha256:2", "sha256:1"]
+    assert history["path"] == "/images/argus-tenant-alice/built/history"
+    assert parse_qsl(urlsplit(save["target"]).query) == [("names", "shared"), ("names", "sha256:1")]
+
+
+def test_the_image_list_shows_the_tenants_own_images_and_registries(docker):
+    docker.answers["GET", "/images/json"] = (200, [OWN, PUBLIC, PRIVATE, BOBS_IMAGE])
+    [response] = docker.send(request("GET", "/v1.55/images/json?all=1"))
+    assert status(response) == 200
+    assert [image["Id"] for image in json.loads(response.split(b"\r\n\r\n", 1)[1])] == ["sha256:1", "sha256:2"]
 
 
 def test_attach_is_checked_then_streams_both_ways(docker):
@@ -423,6 +546,7 @@ def test_attach_is_checked_then_streams_both_ways(docker):
     assert head.startswith(b"HTTP/1.1 101") and rest == b"HELLO STDINBYE"
     [attach] = docker.forwarded()
     assert attach["path"] == "/containers/c-mine/attach" and attach["headers"]["upgrade"] == "tcp"
+    assert "content-type" not in attach["headers"]
 
 
 def test_a_connection_docker_did_not_take_over_carries_nothing_more(docker):
@@ -433,7 +557,67 @@ def test_a_connection_docker_did_not_take_over_carries_nothing_more(docker):
                                      "Connection: Upgrade", "Upgrade: tcp") + smuggled)
     assert status(response) == 409
     assert [r["path"] for r in docker.forwarded()] == ["/exec/e-mine/start"]
+    assert docker.forwarded()[0]["headers"]["content-type"] == "application/json"
     assert docker.extra == b""
+
+
+def test_a_quiet_stream_ends_when_its_client_leaves(docker):
+    async def quiet(reader, writer):  # docker events, logs -f, wait: an answer, then nothing for a while
+        await read_head(reader)
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n")
+        await reader.read()
+        docker.extra = b"let go"
+        writer.close()
+    docker.handle = quiet
+
+    async def steps():
+        reader, writer = await asyncio.open_unix_connection("gate.sock")
+        writer.write(request("GET", "/v1.55/events"))
+        await reader.readuntil(b"\r\n\r\n")
+        writer.close()  # Ctrl-C
+        for _ in range(100):
+            if docker.extra:
+                break
+            await asyncio.sleep(0.02)
+    docker.run(steps)
+    assert docker.extra == b"let go"
+
+
+def test_a_request_that_never_arrives_is_given_up(docker, monkeypatch):
+    monkeypatch.setattr(native_docker, "DEADLINE", 0.2)
+
+    async def steps():
+        reader, writer = await asyncio.open_unix_connection("gate.sock")
+        writer.write(b"POST /v1.55/containers/create HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
+        try:
+            return await asyncio.wait_for(reader.read(), 5)
+        finally:
+            writer.close()
+    assert status(docker.run(steps)) == 502
+    assert not docker.forwarded()
+
+
+def test_a_tenant_holds_only_so_many_connections_open(docker, monkeypatch):
+    monkeypatch.setattr(native_docker, "CONNECTIONS", 2)
+
+    async def steps():
+        held = [await asyncio.open_unix_connection("gate.sock") for _ in range(2)]
+        await asyncio.sleep(0.05)
+        reader, writer = await asyncio.open_unix_connection("gate.sock")
+        writer.write(request("GET", "/v1.55/_ping"))
+        refused = await reader.readuntil(b"\r\n")  # the answer comes before the request is read
+        writer.close()
+        for _, writer in held:
+            writer.close()
+        await asyncio.sleep(0.05)
+        return refused, await exchange(request("GET", "/v1.55/_ping"))
+    refused, allowed = docker.run(steps)
+    assert status(refused) == 503 and status(allowed) == 200
+
+
+def test_a_body_too_large_to_check_quickly_is_refused(docker):
+    [response] = docker.send(request("POST", "/v1.55/containers/create", {"Image": "shared", "Env": ["x" * 1024**2]}))
+    assert status(response) == 413 and not docker.forwarded()
 
 
 def test_the_socket_is_made_only_in_a_real_run_directory(tmp_path, monkeypatch):
