@@ -46,7 +46,9 @@ def sandbox_command(config: dict, tenant: str, command: list[str] | None = None)
     for path in ("/etc/ssl", "/etc/ca-certificates", "/etc/hosts", "/etc/nsswitch.conf", "/etc/passwd", "/etc/group", "/etc/ld.so.cache"):
         if Path(path).exists():
             args.extend(("--ro-bind", path, path))
-    packages = [config[key] for key in ("codex_package", "argus_package") if key in config]
+    # A tenant may keep its own Argus release (preview.json tenants.NAME.argus_package) while the rest move on.
+    argus_package = row.get("argus_package", config.get("argus_package"))
+    packages = [package for package in (config.get("codex_package"), argus_package) if package]
     for path in (source, hosting_source, python, venv, node, *packages):
         args.extend(("--ro-bind", str(path), str(path)))
     args.extend(("--bind", row["directory"], "/tenant", "--ro-bind", config["meter_runtime"], "/meter"))
@@ -85,7 +87,7 @@ def sandbox_command(config: dict, tenant: str, command: list[str] | None = None)
         env.update({"DOCKER_HOST": "unix:///tenant/run/docker.sock", "DOCKER_BUILDKIT": "0"})
     if config.get("runtime") == "js":
         env.update({"ARGUS_HOME": "/tenant/state", "ARGUS_WEB_TOKEN": row["web_token"],
-                    "ARGUS_TRIAL_PACKAGE": config["argus_package"]})
+                    "ARGUS_TRIAL_PACKAGE": argus_package})
         if domain := preview_domain(config.get("preview_domain")):
             env["ARGUS_TRIAL_PREVIEW_URL"] = preview_template(tenant, domain)
     for role in ("ENGINEER", "REVIEWER", "PLANNER", "MANAGER", "LIGHT"):

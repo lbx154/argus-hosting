@@ -250,6 +250,19 @@ def test_all_auxiliary_model_routes_are_pinned(config, tmp_path):
         assert args[index + 1] == MODEL
 
 
+def test_a_tenant_keeps_its_own_argus_release(config, tmp_path):
+    config.update(source=str(tmp_path / 'source'), hosting_source=str(tmp_path / 'hosting'), python_runtime=str(tmp_path / 'python'),
+                  venv=str(tmp_path / 'venv'), node_runtime=str(tmp_path / 'node'), meter_runtime=str(tmp_path / 'meter'),
+                  runtime='js', argus_package=str(tmp_path / 'new'))
+    config['tenants']['alice']['directory'] = str(tmp_path / 'alice')
+    package = lambda args: args[args.index('ARGUS_TRIAL_PACKAGE') + 1]
+    assert package(sandbox_command(config, 'alice')) == str(tmp_path / 'new')
+    config['tenants']['alice']['argus_package'] = str(tmp_path / 'old')
+    args = sandbox_command(config, 'alice')
+    assert package(args) == str(tmp_path / 'old')
+    assert str(tmp_path / 'old') in args and str(tmp_path / 'new') not in args
+
+
 def test_host_watchdog_observes_real_child_memory_and_threads():
     import subprocess
     import sys
