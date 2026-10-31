@@ -31,7 +31,8 @@ def preview_host(host: str, domain: str) -> tuple[bool, str | None]:
     authority = re.fullmatch(r"([^:]+)(?::[0-9]+)?", host.lower())
     if not authority:
         return False, None
-    hostname = authority[1]
+    # A trailing DNS root dot denotes the same host; strip it only for routing.
+    hostname = authority[1].removesuffix(".")
     suffix = "." + domain
     if not domain or not hostname.endswith(suffix):
         return False, None

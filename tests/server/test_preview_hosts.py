@@ -19,6 +19,10 @@ from deploy.try_router import LAST, Router, outward_cookie
 @pytest.mark.parametrize("host,tenant", [
     ("js-trial1-abc123.argusbot.cn", "trial1"),
     ("JS-trial-one-ABC123.argusbot.cn:443", "trial-one"),
+    ("js-trial1-abc123.argusbot.cn.", "trial1"),
+    ("JS-trial-one-ABC123.argusbot.cn.:443", "trial-one"),
+    ("js-trial1-a_b.argusbot.cn.", None),
+    ("js-trial1-a.b.argusbot.cn.:443", None),
     ("js-trial1-a_b.argusbot.cn", None),
     ("js-trial1-a.b.argusbot.cn", None),
     ("js--a.argusbot.cn", None),
@@ -114,15 +118,16 @@ def test_router_cookie_prefix_round_trip():
     asyncio.run(router.client.aclose())
 
 
-def test_router_preview_never_uses_portal_pages_or_websockets():
+@pytest.mark.parametrize("root_dot", ["", "."])
+def test_router_preview_never_uses_portal_pages_or_websockets(root_dot):
     router = Router({"py": 1}, 50, "argusbot.cn")
     client = TestClient(router)
     try:
         for path in ("/", "/py/", "/login", "/healthz"):
-            response = client.get(path, headers={"Host": "js-alice-a.argusbot.cn"})
+            response = client.get(path, headers={"Host": "js-alice-a.argusbot.cn" + root_dot})
             assert response.status_code == 404 and response.content == b""
         for path in ("/api/x", "/_relay", "/trial/stream"):
-            with pytest.raises(WebSocketDisconnect), client.websocket_connect("ws://js-alice-a.argusbot.cn" + path):
+            with pytest.raises(WebSocketDisconnect), client.websocket_connect("ws://js-alice-a.argusbot.cn" + root_dot + path):
                 pass
     finally:
         client.close()
@@ -142,24 +147,26 @@ def test_portal_rejects_old_cookie_name(tmp_path):
         assert client.get("/trial/budget", headers={"Cookie": COOKIE + "=" + token}).status_code == 200
 
 
-def test_preview_host_blocks_every_portal_endpoint_and_websocket(tmp_path):
+@pytest.mark.parametrize("root_dot", ["", "."])
+def test_preview_host_blocks_every_portal_endpoint_and_websocket(tmp_path, root_dot):
     config = {"runtime": "js", "preview_domain": "argusbot.cn", "revision": "fake",
               "tenants": {"alice": {"invite": "fake", "socket": str(tmp_path / "absent.sock")}}}
-    with TestClient(portal_app(config, Ledger(tmp_path / "ledger")), base_url="https://js-missing-a.argusbot.cn") as client:
+    with TestClient(portal_app(config, Ledger(tmp_path / "ledger")), base_url="https://js-missing-a.argusbot.cn" + root_dot) as client:
         for path in ("/", "/login", "/healthz", "/trial/budget", "/trial-quota.js", "/trial-transport.js", "/api/projects", "/docs"):
             response = client.get(path, follow_redirects=False)
             assert response.status_code == 404 and response.content == b""
             assert "set-cookie" not in response.headers
         for method in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"):
-            response = client.request(method, "/login", headers={"Host": "js-alice-a.argusbot.cn"})
+            response = client.request(method, "/login", headers={"Host": "js-alice-a.argusbot.cn" + root_dot})
             assert response.status_code == 405 and response.headers["allow"] == "GET, HEAD"
         for path in ("/api/x", "/_relay", "/trial/stream"):
-            with pytest.raises(WebSocketDisconnect), client.websocket_connect("wss://js-missing-a.argusbot.cn" + path):
+            with pytest.raises(WebSocketDisconnect), client.websocket_connect("wss://js-missing-a.argusbot.cn" + root_dot + path):
                 pass
 
 
 @pytest.mark.integration
-def test_local_router_portal_and_tenant_isolation(tmp_path):
+@pytest.mark.parametrize("root_dot", ["", "."])
+def test_local_router_portal_and_tenant_isolation(tmp_path, root_dot):
     """Real loopback router/portals and two Unix-socket tenants; no host secrets."""
     async def verify():
         seen = []
@@ -227,7 +234,7 @@ def test_local_router_portal_and_tenant_isolation(tmp_path):
                     assert seen[-1][3][b"authorization"] == b"Bearer fake-web-alice"
                     assert seen[-1][3][b"host"] == b"localhost"
                 for name in ("alice", "bob"):
-                    host = f"JS-{name}-abc123.argusbot.cn:443"
+                    host = f"JS-{name}-abc123.argusbot.cn{root_dot}:443"
                     response = await client.get("/js/assets/a%20b.html?x=%2F", headers={"Host": host, "Accept": "text/html",
                         "Cookie": "__Host-js__argus_preview_session=forged", "Authorization": "Bearer fake-relay-only",
                         "Origin": "https://try.argusbot.cn", "Range": "bytes=0-"})
@@ -243,10 +250,10 @@ def test_local_router_portal_and_tenant_isolation(tmp_path):
                     assert response.status_code == 200 and response.content == b""
                 before = len(seen)
                 for path in ("/", "/login", "/healthz", "/trial/budget", "/api/projects"):
-                    response = await client.get(path, headers={"Host": "js-missing-abc.argusbot.cn"})
+                    response = await client.get(path, headers={"Host": "js-missing-abc.argusbot.cn" + root_dot})
                     assert response.status_code == 404 and response.content == b""
                 for method in ("POST", "OPTIONS", "TRACE"):
-                    assert (await client.request(method, "/login", headers={"Host": "js-alice-abc.argusbot.cn"})).status_code == 405
+                    assert (await client.request(method, "/login", headers={"Host": "js-alice-abc.argusbot.cn" + root_dot})).status_code == 405
                 assert len(seen) == before
         finally:
             if router:

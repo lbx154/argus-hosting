@@ -161,7 +161,8 @@ the existing `*.argusbot.cn` certificate covers them.
 Deploy the router and portal changes together, prepare DNS/ingress and matching
 domain configuration, then restart JS tenants on the template-capable Argus
 release. Preview hosts accept only GET/HEAD, never receive portal credentials,
-and bypass portal pages and path rewriting. Unknown tenants return 404.
+and bypass portal pages and path rewriting, including hosts with a trailing DNS
+root dot. The original Host is preserved when forwarding. Unknown tenants return 404.
 Portal session cookies and the router's version cookie now use `__Host-`
 names with Secure, Path=/ and no Domain; only the new names are accepted.
 **Existing users of both versions must enter their invitation once again.**
