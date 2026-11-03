@@ -64,6 +64,12 @@ h1 .dim{display:block;color:rgb(var(--ink-mute))}
 .other,.help{margin:8px 0 0;font-size:13px;color:rgb(var(--ink-mute))}
 .other a{color:rgb(var(--ink-faint));text-underline-offset:3px}
 
+/* 产品截图 */
+.shot{margin:0 0 96px;padding:0}
+.shot img{display:block;width:100%;height:auto;border:1px solid rgb(var(--line));border-radius:20px;
+  -webkit-mask-image:linear-gradient(#000 72%,transparent);mask-image:linear-gradient(#000 72%,transparent)}
+.shot figcaption{margin-top:-8px;text-align:center;font-size:13px;color:rgb(var(--ink-mute))}
+
 /* 一次任务 */
 .story{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:64px;padding:72px 0 120px;border-top:1px solid rgb(var(--line))}
 .story h2{margin:0;font:700 clamp(36px,4.6vw,60px)/1.12 var(--sans);letter-spacing:-.025em}
@@ -104,6 +110,8 @@ h1 .dim{display:block;color:rgb(var(--ink-mute))}
   .field{flex-direction:column}
   .field input{flex:none}
   .field button{width:100%}
+  .shot{margin-bottom:56px}
+  .shot img{border-radius:12px}
   .story{grid-template-columns:minmax(0,1fr);gap:40px;padding:48px 0 72px}
   .log li{grid-template-columns:3.2em 4.4em 1fr;font-size:14px}
   .result{gap:18px}
@@ -162,6 +170,13 @@ form.addEventListener('submit',event=>{input.value=input.value.trim();if(!input.
 if(matchMedia('(pointer:fine)').matches)input.focus({preventScroll:true});
 })();</script>"""
 
+SHOT = """<figure class="shot"><picture>
+  <source srcset="/login/shot-dark.webp" media="(prefers-color-scheme: dark)">
+  <img src="/login/shot-light.webp" width="1600" height="1217" loading="lazy"
+    alt="Argus 工作区：四足机器人腿设计项目，回复里有结论和报告链接，下方是交付的 3D 模型。">
+</picture><figcaption>一个真实项目：设计四足机器人的单腿，交付报告和可直接查看的 3D 模型。</figcaption></figure>"""
+
+
 def entry_page(user_usd: float, *, runtime: str | None = None, title: str | None = None,
                invite: str = "", error: bool = False, other: bool = True) -> str:
     version = "JS 版" if runtime == "js" else "Python 版"
@@ -181,9 +196,10 @@ def entry_page(user_usd: float, *, runtime: str | None = None, title: str | None
     where = "" if runtime is None else f" / {version}"
     back = '<a href="/" rel="noreferrer">← 换版本</a>' if runtime is not None and other else '<span>邀请制试用</span>'
     script = LOGIN_SCRIPT if runtime is not None else ""
+    shot = SHOT if runtime is not None else ""
     return (f'<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<meta name="color-scheme" content="dark light"><title>{escape(heading)}</title>'
             f'<style>{STYLE}</style></head><body><div class="page">'
             f'<header class="head"><div class="head-brand">{BRAND}<span>试用{where}</span></div>{back}</header>'
-            f'<main><section class="hero">{INTRO}{content}</section>{EXAMPLE}</main></div>{script}</body></html>')
+            f'<main><section class="hero">{INTRO}{content}</section>{shot}{EXAMPLE}</main></div>{script}</body></html>')

@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlencode
 import httpx
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import (
+    FileResponse,
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
@@ -355,6 +356,13 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
     async def login_page():
         return HTMLResponse(login_html(), headers={"Cache-Control": "no-store"})
 
+    @app.get("/login/shot-{scheme}.webp")
+    async def login_shot(scheme: str):
+        if scheme not in ("light", "dark"):
+            return JSONResponse({"detail": "Not found"}, 404)
+        return FileResponse(Path(__file__).parent / "login-shots" / f"{scheme}.webp", media_type="image/webp",
+                            headers={"Cache-Control": "public, max-age=86400"})
+
     @app.post("/login")
     async def login(request: Request):
         if not origin_ok(request):
@@ -382,7 +390,7 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
     async def quota_script():
         from fastapi.responses import Response
 
-        return Response("""(()=>{async function update(){const r=await fetch('/trial/budget');if(r.status===401){location.assign('/login');return}if(!r.ok)return;const b=await r.json();const host=document.querySelector('.composer-runtime');if(!host)return;let node=document.getElementById('trial-quota');if(!node){node=document.createElement('span');node.id='trial-quota';node.style.fontSize='11px';host.append(node)}node.style.color=b.exhausted?'#c0392b':'#2069d1';node.textContent=b.exhausted||'试用余额 $'+b.remaining_usd.toFixed(2)+' / $'+b.limit_usd.toFixed(2);node.title='全站剩余 $'+b.total_remaining_usd.toFixed(2)+'；模型 '+b.model}setInterval(update,8000);setTimeout(update,1200)})();""", media_type="text/javascript")
+        return Response("""(()=>{async function update(){const r=await fetch('/trial/budget');if(r.status===401){location.assign('/login');return}if(!r.ok)return;const b=await r.json();const host=document.querySelector('.composer-runtime');if(!host)return;let node=document.getElementById('trial-quota');if(!node){node=document.createElement('span');node.id='trial-quota';node.style.fontSize='11px';host.append(node)}node.style.color=b.exhausted?'#c0392b':'';node.textContent=b.exhausted||'试用余额 $'+b.remaining_usd.toFixed(2)+' / $'+b.limit_usd.toFixed(2);node.title='全站剩余 $'+b.total_remaining_usd.toFixed(2)+'；模型 '+b.model}setInterval(update,8000);setTimeout(update,1200)})();""", media_type="text/javascript")
 
     @app.get("/trial-transport.js")
     async def transport_script():
