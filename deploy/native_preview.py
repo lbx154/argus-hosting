@@ -114,20 +114,27 @@ class Ledger:
                 "exhausted": self.refusal(tenant)}
 
 
+# USD per million tokens for the one model the trial serves: input, cached input, output;
+# past LONG_CONTEXT input tokens a call costs 2x input and 1.5x output (OpenAI's list price).
+PRICES = {"gpt-6.1-sol": (2.0, 0.1, 10.0)}
+LONG_CONTEXT = 272_000
+
+
 def token_cost(response) -> float | None:
     """Price a Responses result from the usage its upstream reports; ``None`` when there is none."""
-    from argus.core.pricing import quote_token_usage
-
     usage = response.get("usage") if isinstance(response, dict) else None
-    if not isinstance(usage, dict):
+    if not isinstance(usage, dict) or MODEL not in PRICES:
         return None
     counts = [usage.get("input_tokens"), usage.get("output_tokens")]
     if any(type(value) is not int or value < 0 for value in counts):
         return None
+    tokens_in, tokens_out = counts
     cached = (usage.get("input_tokens_details") or {}).get("cached_tokens")
-    quote = quote_token_usage(MODEL, input_tokens=counts[0], output_tokens=counts[1],
-                              cached_input_tokens=cached if type(cached) is int else 0)
-    return quote.cost_usd if quote.status == "priced" else None
+    cached = min(cached, tokens_in) if type(cached) is int and cached > 0 else 0
+    fresh, cache, out = PRICES[MODEL]
+    long = tokens_in > LONG_CONTEXT
+    return ((tokens_in - cached) * fresh * (2 if long else 1) + cached * cache * (2 if long else 1)
+            + tokens_out * out * (1.5 if long else 1)) / 1_000_000
 
 
 def load_config(path: Path) -> dict:

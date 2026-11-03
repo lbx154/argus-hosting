@@ -51,10 +51,13 @@ linux_host_deadlines = pytest.mark.skipif(
 
 @functools.cache
 def runtime_pythonpath() -> str:
-    """Use the real installed packages and their installed entry-point metadata."""
-    import argus
-
+    """Use the real installed packages and their installed entry-point metadata.
+    The Python Argus is only the Python platform's; the live trial (deploy/) runs without it."""
     import argus_trial_server
 
-    return os.pathsep.join((str(Path(argus.__file__).resolve().parent.parent),
-                            str(Path(argus_trial_server.__file__).resolve().parent.parent)))
+    roots = [str(Path(argus_trial_server.__file__).resolve().parent.parent)]
+    try:
+        import argus
+    except ImportError:
+        return os.pathsep.join(roots)
+    return os.pathsep.join([str(Path(argus.__file__).resolve().parent.parent), *roots])
