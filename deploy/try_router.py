@@ -108,6 +108,8 @@ class Router:
         navigation = headers.get("sec-fetch-mode") == "navigate" or (
             "sec-fetch-mode" not in headers and "text/html" in headers.get("accept", ""))
         if not preview and scope["path"] == "/" and known != "referer":
+            if len(self.versions) == 1:  # one version left: nothing to choose between
+                return await redirect(send, f"/{next(iter(self.versions))}/" + ("?" + query if query else ""))
             return await respond(send, 200, self.landing, "text/html; charset=utf-8")
         if version is None:
             return await respond(send, 404, NOT_FOUND.encode(), "text/html; charset=utf-8")

@@ -1,6 +1,7 @@
 """Shared, self-contained trial entry pages for the router and both portals."""
 from __future__ import annotations
 
+import re
 from html import escape
 
 STYLE = """:root {
@@ -182,9 +183,11 @@ if(matchMedia('(pointer:fine)').matches)input.focus({preventScroll:true});
 })();</script>"""
 
 def entry_page(user_usd: float, *, runtime: str | None = None, title: str | None = None,
-               invite: str = "", error: bool = False) -> str:
+               invite: str = "", error: bool = False, other: bool = True) -> str:
     version = "JS 版" if runtime == "js" else "Python 版"
     content = LANDING_CONTENT if runtime is None else LOGIN_CONTENT
+    if not other:  # the site serves this version only: no link to one that is gone
+        content = re.sub(r'<p class="other">.*?</p>', "", content)
     # Replace user-provided values last so their contents remain literal text.
     content = content.replace("{user}", f"{user_usd:g}")
     content = content.replace("{other_path}", "py" if runtime == "js" else "js")
@@ -196,7 +199,7 @@ def entry_page(user_usd: float, *, runtime: str | None = None, title: str | None
     if title:
         heading = title
     where = "" if runtime is None else f" / {version}"
-    back = '<a href="/" rel="noreferrer">← 换版本</a>' if runtime is not None else '<span>邀请制试用</span>'
+    back = '<a href="/" rel="noreferrer">← 换版本</a>' if runtime is not None and other else '<span>邀请制试用</span>'
     script = LOGIN_SCRIPT if runtime is not None else ""
     return (f'<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'

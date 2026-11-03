@@ -311,7 +311,8 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
     invites = {row["invite"]: name for name, row in config["tenants"].items()}
     def login_html(*, invite: str = "", error: bool = False) -> str:
         return entry_page(ledger.user / MICRO, runtime=config.get("runtime", "py"),
-                          title=config.get("title"), invite=invite, error=error)
+                          title=config.get("title"), invite=invite, error=error,
+                          other=config.get("other_version", True))
 
     # A session is a random token the portal holds, not a signed claim. It is
     # kept as issued next to the ledger so a portal restart (every deploy) does
