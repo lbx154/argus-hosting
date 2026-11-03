@@ -221,14 +221,11 @@ def storage_usage(directory: str | Path) -> tuple[int, int]:
 
 
 def cache_directories(directory: str | Path) -> list[Path]:
-    """The tenant's download caches: what its agents share, and the copies
-    each project's private home kept before they were shared."""
-    from argus.core.sandbox import SHARED_CACHES
-
+    """The tenant's download caches: what its agents share (Argus mounts
+    state/cache as every sandbox's ~/.cache), and the copies each project's
+    private home kept before they were shared."""
     state = Path(directory) / "state"
-    return [state / "cache", *(
-        home / inside for home in sorted(state.glob("sandbox/*/tenant/home")) for inside in SHARED_CACHES.values()
-    )]
+    return [state / "cache", *(home / ".cache" for home in sorted(state.glob("sandbox/*/tenant/home")))]
 
 
 def prune_caches(directory: str | Path, size: int, count: int, *, target: int, target_entries: int) -> tuple[int, int]:

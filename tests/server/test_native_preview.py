@@ -58,8 +58,11 @@ def completed(usage):
 
 
 def price(input_tokens, output_tokens, cached=0):
-    from argus.core.pricing import quote_token_usage
-    return quote_token_usage(MODEL, input_tokens=input_tokens, output_tokens=output_tokens, cached_input_tokens=cached).cost_usd
+    # gpt-6.1-sol list price per million tokens: $2 input, $0.10 cached input, $10 output;
+    # past 272k input tokens, input costs 2x and output 1.5x.
+    long = input_tokens > 272_000
+    return ((input_tokens - cached) * 2.0 * (2 if long else 1) + cached * 0.1 * (2 if long else 1)
+            + output_tokens * 10.0 * (1.5 if long else 1)) / 1_000_000
 
 
 def test_allowances_refuse_once_spent_and_never_reset(tmp_path):
@@ -183,7 +186,7 @@ def test_meter_charges_a_whole_response_too(config, ledger, monkeypatch, tmp_pat
 def test_token_usage_is_priced_and_missing_usage_is_none():
     usage = {'input_tokens': 1_000_000, 'output_tokens': 100_000, 'input_tokens_details': {'cached_tokens': 400_000}}
     assert token_cost({'usage': usage}) == pytest.approx(price(1_000_000, 100_000, 400_000))
-    assert price(1_000_000, 100_000, 400_000) > 0
+    assert price(1_000_000, 100_000, 400_000) == pytest.approx(3.98)  # 600k x $4 + 400k x $0.20 + 100k x $15, per million
     for response in (None, [], {}, {'usage': {'input_tokens': 5}}, {'usage': {'input_tokens': -1, 'output_tokens': 1}}):
         assert token_cost(response) is None
 

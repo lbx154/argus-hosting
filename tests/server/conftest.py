@@ -16,14 +16,17 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from argus.core import hosting
 from hosted_platform import runtime_pythonpath
 
 from argus_trial_server.hosted_host import HostedHostRequired
 
 # Argus finds the runtime by its entry point, as on the hosting machine.
 sys.path.extend(path for path in runtime_pythonpath().split(os.pathsep) if path not in sys.path)
-hosting.hosted_runtime.cache_clear()
+try:  # The Python platform's tests; the live trial (deploy/) runs without the Python Argus.
+    from argus.core import hosting
+    hosting.hosted_runtime.cache_clear()
+except (ImportError, AttributeError):
+    pass
 
 
 @pytest.hookimpl(hookwrapper=True)
