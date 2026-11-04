@@ -9,11 +9,10 @@ interrupted waits; the project page says why. Every file stays on disk.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
-
-from argus.core.atomic_replace import write_atomic
 
 STORAGE_PAUSE_FILE = "storage-pause.json"
 
@@ -24,10 +23,13 @@ def storage_pause_path(root: str | Path) -> Path:
 
 def record_storage_pause(root: str | Path, *, used_bytes: int, limit_bytes: int) -> None:
     Path(root).mkdir(parents=True, exist_ok=True)
-    write_atomic(storage_pause_path(root), json.dumps({
+    path = storage_pause_path(root)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps({
         "schema_version": 1, "used_bytes": int(used_bytes), "limit_bytes": int(limit_bytes),
         "since": time.time(),
-    }))
+    }), encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def clear_storage_pause(root: str | Path) -> None:

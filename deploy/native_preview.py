@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlencode
 import httpx
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import (
+    FileResponse,
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
@@ -114,20 +115,27 @@ class Ledger:
                 "exhausted": self.refusal(tenant)}
 
 
+# USD per million tokens for the one model the trial serves: input, cached input, output;
+# past LONG_CONTEXT input tokens a call costs 2x input and 1.5x output (OpenAI's list price).
+PRICES = {"gpt-6.1-sol": (2.0, 0.1, 10.0)}
+LONG_CONTEXT = 272_000
+
+
 def token_cost(response) -> float | None:
     """Price a Responses result from the usage its upstream reports; ``None`` when there is none."""
-    from argus.core.pricing import quote_token_usage
-
     usage = response.get("usage") if isinstance(response, dict) else None
-    if not isinstance(usage, dict):
+    if not isinstance(usage, dict) or MODEL not in PRICES:
         return None
     counts = [usage.get("input_tokens"), usage.get("output_tokens")]
     if any(type(value) is not int or value < 0 for value in counts):
         return None
+    tokens_in, tokens_out = counts
     cached = (usage.get("input_tokens_details") or {}).get("cached_tokens")
-    quote = quote_token_usage(MODEL, input_tokens=counts[0], output_tokens=counts[1],
-                              cached_input_tokens=cached if type(cached) is int else 0)
-    return quote.cost_usd if quote.status == "priced" else None
+    cached = min(cached, tokens_in) if type(cached) is int and cached > 0 else 0
+    fresh, cache, out = PRICES[MODEL]
+    long = tokens_in > LONG_CONTEXT
+    return ((tokens_in - cached) * fresh * (2 if long else 1) + cached * cache * (2 if long else 1)
+            + tokens_out * out * (1.5 if long else 1)) / 1_000_000
 
 
 def load_config(path: Path) -> dict:
@@ -311,7 +319,8 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
     invites = {row["invite"]: name for name, row in config["tenants"].items()}
     def login_html(*, invite: str = "", error: bool = False) -> str:
         return entry_page(ledger.user / MICRO, runtime=config.get("runtime", "py"),
-                          title=config.get("title"), invite=invite, error=error)
+                          title=config.get("title"), invite=invite, error=error,
+                          other=config.get("other_version", True))
 
     # A session is a random token the portal holds, not a signed claim. It is
     # kept as issued next to the ledger so a portal restart (every deploy) does
@@ -354,6 +363,13 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
     async def login_page():
         return HTMLResponse(login_html(), headers={"Cache-Control": "no-store"})
 
+    @app.get("/login/shot-{scheme}.webp")
+    async def login_shot(scheme: str):
+        if scheme not in ("light", "dark"):
+            return JSONResponse({"detail": "Not found"}, 404)
+        return FileResponse(Path(__file__).parent / "login-shots" / f"{scheme}.webp", media_type="image/webp",
+                            headers={"Cache-Control": "public, max-age=86400"})
+
     @app.post("/login")
     async def login(request: Request):
         if not origin_ok(request):
@@ -381,7 +397,7 @@ def portal_app(config: dict, ledger: Ledger) -> FastAPI:
     async def quota_script():
         from fastapi.responses import Response
 
-        return Response("""(()=>{async function update(){const r=await fetch('/trial/budget');if(r.status===401){location.assign('/login');return}if(!r.ok)return;const b=await r.json();const host=document.querySelector('.composer-runtime');if(!host)return;let node=document.getElementById('trial-quota');if(!node){node=document.createElement('span');node.id='trial-quota';node.style.fontSize='11px';host.append(node)}node.style.color=b.exhausted?'#c0392b':'#2069d1';node.textContent=b.exhausted||'试用余额 $'+b.remaining_usd.toFixed(2)+' / $'+b.limit_usd.toFixed(2);node.title='全站剩余 $'+b.total_remaining_usd.toFixed(2)+'；模型 '+b.model}setInterval(update,8000);setTimeout(update,1200)})();""", media_type="text/javascript")
+        return Response("""(()=>{async function update(){const r=await fetch('/trial/budget');if(r.status===401){location.assign('/login');return}if(!r.ok)return;const b=await r.json();const host=document.querySelector('.composer-runtime');if(!host)return;let node=document.getElementById('trial-quota');if(!node){node=document.createElement('span');node.id='trial-quota';node.style.fontSize='11px';host.append(node)}let team=null;try{const p=await fetch('/api/projects');if(p.ok)team=(await p.json()).projects.reduce((sum,row)=>sum+(typeof row.spend_usd==='number'?row.spend_usd:0),0)}catch{}const other=team===null?0:b.used_usd-team;const usd=v=>'$'+v.toFixed(2);node.style.color=b.exhausted?'#c0392b':'';node.textContent=b.exhausted||'试用余额 '+usd(b.remaining_usd)+' / '+usd(b.limit_usd)+(other>=0.05?' · 其中程序直接调用 ≈'+usd(other):'');node.title='已用 '+usd(b.used_usd)+(team===null?'':'：团队 ≈'+usd(Math.min(team,b.used_usd))+'（侧栏各项目花费之和），其余 ≈'+usd(Math.max(0,other))+' 是项目里的程序直接调用模型或已删除的项目')+'。全站剩余 '+usd(b.total_remaining_usd)+'；模型 '+b.model}setInterval(update,8000);setTimeout(update,1200)})();""", media_type="text/javascript")
 
     @app.get("/trial-transport.js")
     async def transport_script():

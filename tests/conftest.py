@@ -99,7 +99,11 @@ def _no_real_copilot_help_probe(monkeypatch: pytest.MonkeyPatch) -> Iterator[Non
     argv/identity path every Copilot-backed test exercises. Default to "no
     such flag"; a test that exercises the binding stubs the probe itself.
     """
-    from argus.agent_cli import copilot_session as _copilot_session
+    try:
+        from argus.agent_cli import copilot_session as _copilot_session
+    except ImportError:  # The live trial (deploy/) runs the TS Argus; only the Python platform has this.
+        yield
+        return
 
     _copilot_session.reset_copilot_session_id_support_cache()
     monkeypatch.setattr(_copilot_session, "_copilot_help_text", lambda executable: "")
@@ -112,6 +116,10 @@ def _no_host_sandbox(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyP
     run without the host's sandbox; a test of the sandbox asks for
     ``host_sandbox``."""
     if "host_sandbox" not in request.fixturenames:
+        try:
+            import argus.core.sandbox  # noqa: F401
+        except ImportError:
+            return
         monkeypatch.setattr("argus.core.sandbox.sandbox_tool", lambda: None)
 
 @pytest.fixture
@@ -129,7 +137,11 @@ def _no_stop_leaks_between_tests():
     wait deep inside a mission can see a signal. One test setting it once made
     an unrelated external-work test read `stop_requested` instead of the
     outcome that had actually arrived."""
-    from argus.core import process_stop
+    try:
+        from argus.core import process_stop
+    except ImportError:
+        yield
+        return
 
     process_stop.clear_stop()
     yield
