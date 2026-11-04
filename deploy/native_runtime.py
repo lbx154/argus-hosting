@@ -365,13 +365,18 @@ def main():
             watchdog = ResourceWatchdog(child.pid, memory_bytes=int(float(limits.get("memory_gb", 128)) * 1024**3),
                                         tasks=int(limits.get("tasks", 65536)))
             storage = StorageWatch(directory, config.get("limits"))
-            last_storage = 0.0
+            # Both checks cost CPU on every launcher: listing a runtime's processes reads every process on
+            # the host (~50 ms with 2,000), and a 40 GB workspace takes over a second to walk.
+            next_watch = next_storage = 0.0
             while child.poll() is None:
                 now = time.monotonic()
-                reason = watchdog.exceeded() if args.mode == "launch" else ""
-                if args.mode == "launch" and now - last_storage >= 2:
-                    last_storage = now
+                reason = ""
+                if args.mode == "launch" and now >= next_watch:
+                    next_watch = now + 5
+                    reason = watchdog.exceeded()
+                if args.mode == "launch" and now >= next_storage:
                     outcome = storage.check()
+                    next_storage = now + max(30, 20 * (time.monotonic() - now))
                     if outcome == "resume":
                         print("Trial workspace storage is under its limit again; restarting runtime", flush=True)
                         stop_runtime(child)
